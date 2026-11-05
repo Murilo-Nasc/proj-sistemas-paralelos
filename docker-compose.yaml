@@ -1,0 +1,65 @@
+x-python: &python-base
+  build:
+    context: ./python
+    dockerfile: Dockerfile
+  image: chat-sd:python
+
+services:
+  broker:
+    <<: *python-base
+    container_name: broker
+    command: ["python", "broker.py"]
+
+  servidor-py-1:
+    <<: *python-base
+    container_name: servidor-py-1
+    command: ["python", "servidor.py"]
+    environment:
+      NOME_SERVIDOR: servidor-py-1
+      DB_PATH: /data/servidor-py-1.db
+      BROKER_HOST: broker
+    volumes:
+      - dados-servidor-py-1:/data
+    depends_on:
+      - broker
+
+  servidor-py-2:
+    <<: *python-base
+    container_name: servidor-py-2
+    command: ["python", "servidor.py"]
+    environment:
+      NOME_SERVIDOR: servidor-py-2
+      DB_PATH: /data/servidor-py-2.db
+      BROKER_HOST: broker
+    volumes:
+      - dados-servidor-py-2:/data
+    depends_on:
+      - broker
+
+  cliente-py-1:
+    <<: *python-base
+    container_name: cliente-py-1
+    command: ["python", "cliente.py"]
+    environment:
+      NOME_USUARIO: bot_py_1
+      BROKER_HOST: broker
+    depends_on:
+      - broker
+      - servidor-py-1
+      - servidor-py-2
+
+  cliente-py-2:
+    <<: *python-base
+    container_name: cliente-py-2
+    command: ["python", "cliente.py"]
+    environment:
+      NOME_USUARIO: bot_py_2
+      BROKER_HOST: broker
+    depends_on:
+      - broker
+      - servidor-py-1
+      - servidor-py-2
+
+volumes:
+  dados-servidor-py-1:
+  dados-servidor-py-2:

@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+*.db
+*.db-journal
+data/
+
+target/
+build/
+*.class
+.gradle/
+
+.idea/
+*.iml
+.DS_Store

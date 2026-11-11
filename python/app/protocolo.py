@@ -10,6 +10,9 @@ CREATE_CHANNEL = "create_channel"
 CREATE_CHANNEL_REPLY = "create_channel_reply"
 LIST_CHANNELS = "list_channels"
 LIST_CHANNELS_REPLY = "list_channels_reply"
+PUBLISH = "publish"
+PUBLISH_REPLY = "publish_reply"
+PUBLICATION = "publication"
 ERROR_REPLY = "error_reply"
 
 OK = "ok"
@@ -21,6 +24,8 @@ ERR_INTERNAL = "INTERNAL_ERROR"
 
 USER_RE = re.compile(r"^[A-Za-z0-9_-]{3,20}$")
 CHANNEL_RE = re.compile(r"^[a-z0-9_-]{3,30}$")
+MAX_MENSAGEM = 500
+MAX_MSG_ID = 64
 
 
 def agora_ms() -> int:
@@ -70,10 +75,23 @@ def desserializar(raw: bytes) -> dict:
 def log(texto: str) -> None:
     print(texto, flush=True)
 
+def _hora() -> str:
+    return datetime.now().strftime("%H:%M:%S.%f")[:-3]
+
 
 def formatar_log(quem: str, direcao: str, msg: dict) -> str:
-    hora = datetime.now().strftime("%H:%M:%S.%f")[:-3]
     return (
-        f"[{hora}] [{quem}] {direcao} {msg['type']} | de={msg['sender']} "
+        f"[{_hora()}] [{quem}] {direcao} {msg['type']} | de={msg['sender']} "
         f"| ts={msg['timestamp']} | dados={msg['data']}"
+    )
+
+
+def formatar_publicacao_recebida(quem: str, topico: str, msg: dict, recebido_ms: int) -> str:
+    dados = msg["data"]
+    return (
+        f"[{_hora()}] [{quem}] RECEBIDO << PUBLICAÇÃO canal={topico} "
+        f"| mensagem={dados.get('message')!r} | autor={dados.get('user')} "
+        f"| servidor={msg['sender']} | enviado_ts={msg['timestamp']} "
+        f"| recebido_ts={recebido_ms} | atraso={recebido_ms - msg['timestamp']} ms "
+        f"| msg_id={dados.get('msg_id')}"
     )

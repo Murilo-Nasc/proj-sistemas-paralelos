@@ -16,6 +16,11 @@ services:
     container_name: broker
     command: ["python", "broker.py"]
 
+  proxy:
+    <<: *python-base
+    container_name: proxy
+    command: ["python", "proxy.py"]
+
   servidor-py-1:
     <<: *python-base
     container_name: servidor-py-1
@@ -24,10 +29,12 @@ services:
       NOME_SERVIDOR: servidor-py-1
       DB_PATH: /data/servidor-py-1.db
       BROKER_HOST: broker
+      PROXY_HOST: proxy
     volumes:
       - dados-servidor-py-1:/data
     depends_on:
       - broker
+      - proxy
 
   servidor-py-2:
     <<: *python-base
@@ -37,10 +44,12 @@ services:
       NOME_SERVIDOR: servidor-py-2
       DB_PATH: /data/servidor-py-2.db
       BROKER_HOST: broker
+      PROXY_HOST: proxy
     volumes:
       - dados-servidor-py-2:/data
     depends_on:
       - broker
+      - proxy
 
   cliente-py-1:
     <<: *python-base
@@ -49,8 +58,10 @@ services:
     environment:
       NOME_USUARIO: bot_py_1
       BROKER_HOST: broker
+      PROXY_HOST: proxy
     depends_on:
       - broker
+      - proxy
       - servidor-py-1
       - servidor-py-2
       - servidor-java-1
@@ -63,8 +74,10 @@ services:
     environment:
       NOME_USUARIO: bot_py_2
       BROKER_HOST: broker
+      PROXY_HOST: proxy
     depends_on:
       - broker
+      - proxy
       - servidor-py-1
       - servidor-py-2
       - servidor-java-1
@@ -78,10 +91,12 @@ services:
       NOME_SERVIDOR: servidor-java-1
       DB_PATH: /data/servidor-java-1.db
       BROKER_HOST: broker
+      PROXY_HOST: proxy
     volumes:
       - dados-servidor-java-1:/data
     depends_on:
       - broker
+      - proxy
 
   servidor-java-2:
     <<: *java-base
@@ -91,10 +106,12 @@ services:
       NOME_SERVIDOR: servidor-java-2
       DB_PATH: /data/servidor-java-2.db
       BROKER_HOST: broker
+      PROXY_HOST: proxy
     volumes:
       - dados-servidor-java-2:/data
     depends_on:
       - broker
+      - proxy
 
   cliente-java-1:
     <<: *java-base
@@ -103,8 +120,10 @@ services:
     environment:
       NOME_USUARIO: bot_java_1
       BROKER_HOST: broker
+      PROXY_HOST: proxy
     depends_on:
       - broker
+      - proxy
       - servidor-py-1
       - servidor-py-2
       - servidor-java-1
@@ -117,8 +136,10 @@ services:
     environment:
       NOME_USUARIO: bot_java_2
       BROKER_HOST: broker
+      PROXY_HOST: proxy
     depends_on:
       - broker
+      - proxy
       - servidor-py-1
       - servidor-py-2
       - servidor-java-1

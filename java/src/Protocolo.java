@@ -49,6 +49,9 @@ public final class Protocolo {
     public static final String CREATE_CHANNEL_REPLY = "create_channel_reply";
     public static final String LIST_CHANNELS = "list_channels";
     public static final String LIST_CHANNELS_REPLY = "list_channels_reply";
+    public static final String PUBLISH = "publish";
+    public static final String PUBLISH_REPLY = "publish_reply";
+    public static final String PUBLICATION = "publication";
     public static final String ERROR_REPLY = "error_reply";
 
     public static final String OK = "ok";
@@ -60,6 +63,8 @@ public final class Protocolo {
 
     public static final Pattern USER_RE = Pattern.compile("^[A-Za-z0-9_-]{3,20}$");
     public static final Pattern CHANNEL_RE = Pattern.compile("^[a-z0-9_-]{3,30}$");
+    public static final int MAX_MENSAGEM = 500;
+    public static final int MAX_MSG_ID = 64;
 
     private static final DateTimeFormatter HORA = DateTimeFormatter.ofPattern("HH:mm:ss.SSS");
 
@@ -209,6 +214,15 @@ public final class Protocolo {
     public static String formatarLog(String quem, String direcao, Mensagem msg) {
         return "[" + LocalTime.now().format(HORA) + "] [" + quem + "] " + direcao + " " + msg.type()
                 + " | de=" + msg.sender() + " | ts=" + msg.timestamp() + " | dados=" + repr(msg.data());
+    }
+
+    public static String formatarPublicacaoRecebida(String quem, String topico, Mensagem msg, long recebidoMs) {
+        Map<String, Object> dados = msg.data();
+        return "[" + LocalTime.now().format(HORA) + "] [" + quem + "] RECEBIDO << PUBLICAÇÃO canal=" + topico
+                + " | mensagem=" + repr(dados.get("message")) + " | autor=" + dados.get("user")
+                + " | servidor=" + msg.sender() + " | enviado_ts=" + msg.timestamp()
+                + " | recebido_ts=" + recebidoMs + " | atraso=" + (recebidoMs - msg.timestamp())
+                + " ms | msg_id=" + dados.get("msg_id");
     }
 
     static String repr(Object valor) {

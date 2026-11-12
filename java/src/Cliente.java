@@ -1,17 +1,31 @@
+import java.nio.charset.StandardCharsets;
 import java.security.SecureRandom;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
+import java.util.UUID;
 import org.zeromq.SocketType;
 import org.zeromq.ZContext;
 import org.zeromq.ZMQ;
 
 public final class Cliente {
     private static final int MIN_CANAIS = 5;
+    private static final int MIN_ASSINATURAS = 3;
+    private static final int MENSAGENS_POR_RODADA = 10;
     private static final int TIMEOUT_MS = 3000;
-    private static final int INTERVALO_LISTAGEM_MS = 5000;
+    private static final int INTERVALO_MENSAGENS_MS = 1000;
     private static final SecureRandom RANDOM = new SecureRandom();
+
+    private static final String[] FRASES = {
+        "Bom dia, pessoal!", "Alguém viu o resultado do jogo?",
+        "Estou testando o sistema distribuído", "ZeroMQ é bem mais simples do que parece",
+        "Quem está online por aqui?", "Mais uma mensagem aleatória",
+        "O broker está distribuindo bem as requisições", "Pub/Sub funcionando por aqui",
+        "Vamos ver se essa chega a todo mundo", "Até já, volto em alguns segundos"
+    };
 
     private Cliente() {}
 
@@ -57,6 +71,67 @@ public final class Cliente {
 
         void fechar() {
             ctx.destroySocket(sock);
+        }
+    }
+
+    static final class Assinante {
+        private final ZMQ.Socket sock;
+        private String nome;
+        private final Set<String> canais = new LinkedHashSet<>();
+
+        Assinante(ZContext ctx, String endpoint, String nome) {
+            this.nome = nome;
+            sock = ctx.createSocket(SocketType.SUB);
+            sock.setLinger(0);
+            sock.setReceiveTimeOut(100);
+            sock.connect(endpoint);
+        }
+
+        void assinar(String canal) {
+            if (canais.add(canal)) {
+                sock.subscribe(canal.getBytes(StandardCharsets.UTF_8));
+                Protocolo.Log.log("[cliente " + nome + "] inscrito no canal '" + canal
+                        + "' (total: " + canais.size() + ")");
+            }
+        }
+
+        int quantidade() {
+            return canais.size();
+        }
+
+        boolean contem(String canal) {
+            return canais.contains(canal);
+        }
+
+        void esperar(int milissegundos) throws InterruptedException {
+            long limite = System.currentTimeMillis() + milissegundos;
+            while (System.currentTimeMillis() < limite) {
+                String topico = sock.recvStr(0);
+                if (topico == null) {
+                    continue;
+                }
+                byte[] raw = sock.recv(0);
+                if (raw == null) {
+                    continue;
+                }
+                long recebido = Protocolo.agoraMs();
+                try {
+                    Protocolo.Mensagem msg = Protocolo.desserializar(raw);
+                    if (canais.contains(topico) && Protocolo.PUBLICATION.equals(msg.type())
+                            && topico.equals(msg.data().get("channel"))) {
+                        Protocolo.Log.log(Protocolo.formatarPublicacaoRecebida(
+                                "cliente " + nome, topico, msg, recebido));
+                    } else {
+                        Protocolo.Log.log("[cliente " + nome + "] publicação descartada: tipo/canal inconsistente");
+                    }
+                } catch (Protocolo.ProtocoloException e) {
+                    Protocolo.Log.log("[cliente " + nome + "] publicação descartada (inválida): " + e.getMessage());
+                }
+            }
+        }
+
+        void fechar() {
+            sock.close();
         }
     }
 
@@ -109,6 +184,61 @@ public final class Cliente {
         return false;
     }
 
+    static boolean publicar(Conexao con, String canal, String texto) throws Exception {
+        Map<String, Object> pedido = new LinkedHashMap<>();
+        pedido.put("channel", canal);
+        pedido.put("message", texto);
+        pedido.put("msg_id", UUID.randomUUID().toString());
+        Map<String, Object> dados = con.requisitar(Protocolo.PUBLISH, pedido).data();
+        if (Protocolo.OK.equals(dados.get("status"))) {
+            return true;
+        }
+        Protocolo.Log.log("[cliente " + con.nome + "] publicação em '" + canal + "' falhou: "
+                + dados.get("error") + " - " + dados.get("message"));
+        return false;
+    }
+
+    static String textoAleatorio() {
+        return FRASES[RANDOM.nextInt(FRASES.length)] + " [" + sufixoAleatorio().substring(0, 4) + "]";
+    }
+
+    static void rodada(Conexao con, Assinante assinante) throws Exception {
+        List<String> canais = listarCanais(con);
+
+        if (canais.size() < MIN_CANAIS) {
+            String novo = "canal-" + sufixoAleatorio();
+            if (criarCanal(con, novo)) {
+                canais.add(novo);
+            }
+        }
+
+        if (assinante.quantidade() < MIN_ASSINATURAS) {
+            List<String> candidatos = new ArrayList<>();
+            for (String canal : canais) {
+                if (!assinante.contem(canal)) {
+                    candidatos.add(canal);
+                }
+            }
+            if (!candidatos.isEmpty()) {
+                assinante.assinar(candidatos.get(RANDOM.nextInt(candidatos.size())));
+            }
+        }
+
+        if (canais.isEmpty()) {
+            Protocolo.Log.log("[cliente " + con.nome + "] nenhum canal disponível, tentando novamente...");
+            assinante.esperar(INTERVALO_MENSAGENS_MS);
+            return;
+        }
+
+        String canal = canais.get(RANDOM.nextInt(canais.size()));
+        Protocolo.Log.log("[cliente " + con.nome + "] publicando " + MENSAGENS_POR_RODADA
+                + " mensagens no canal '" + canal + "'");
+        for (int i = 0; i < MENSAGENS_POR_RODADA; i++) {
+            publicar(con, canal, textoAleatorio());
+            assinante.esperar(INTERVALO_MENSAGENS_MS);
+        }
+    }
+
     public static void executar() throws Exception {
         String nome = System.getenv("NOME_USUARIO");
         if (nome == null || nome.isBlank()) {
@@ -116,29 +246,24 @@ public final class Cliente {
         }
         String host = System.getenv().getOrDefault("BROKER_HOST", "broker");
         String porta = System.getenv().getOrDefault("BROKER_FRONTEND_PORT", "5555");
+        String proxyHost = System.getenv().getOrDefault("PROXY_HOST", "proxy");
+        String portaXpub = System.getenv().getOrDefault("PROXY_XPUB_PORT", "5558");
 
         try (ZContext ctx = new ZContext()) {
             Conexao con = new Conexao(ctx, "tcp://" + host + ":" + porta, nome);
+            Assinante assinante = new Assinante(ctx, "tcp://" + proxyHost + ":" + portaXpub, nome);
             try {
                 fazerLogin(con);
-
-                List<String> canais = listarCanais(con);
-                if (!canais.contains("geral")) {
-                    criarCanal(con, "geral");
-                }
-                canais = listarCanais(con);
-                if (canais.size() < MIN_CANAIS) {
-                    criarCanal(con, "canal-" + sufixoAleatorio());
-                }
+                assinante.nome = con.nome;
 
                 while (!Thread.currentThread().isInterrupted()) {
-                    listarCanais(con);
-                    Thread.sleep(INTERVALO_LISTAGEM_MS);
+                    rodada(con, assinante);
                 }
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
             } finally {
                 con.fechar();
+                assinante.fechar();
             }
         }
     }

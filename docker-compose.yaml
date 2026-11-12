@@ -20,6 +20,9 @@ services:
     <<: *python-base
     container_name: proxy
     command: ["python", "proxy.py"]
+    expose:
+      - "5557"
+      - "5558"
 
   servidor-py-1:
     <<: *python-base

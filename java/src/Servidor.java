@@ -42,6 +42,16 @@ public final class Servidor {
                                 + "nome TEXT PRIMARY KEY, "
                                 + "criado_por TEXT NOT NULL, "
                                 + "timestamp_ms INTEGER NOT NULL)");
+                st.executeUpdate(
+                        "CREATE TABLE IF NOT EXISTS publicacoes ("
+                                + "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                                + "msg_id TEXT NOT NULL UNIQUE, "
+                                + "canal TEXT NOT NULL, "
+                                + "usuario TEXT NOT NULL, "
+                                + "mensagem TEXT NOT NULL, "
+                                + "ts_cliente_ms INTEGER NOT NULL, "
+                                + "ts_publicacao_ms INTEGER NOT NULL, "
+                                + "servidor TEXT NOT NULL)");
             }
         }
 
@@ -76,13 +86,38 @@ public final class Servidor {
             return canais;
         }
 
+        public boolean registrarPublicacao(String msgId, String canal, String usuario, String mensagem,
+                                           long tsCliente, long tsPublicacao, String servidor) throws SQLException {
+            try (PreparedStatement ps = con.prepareStatement(
+                    "INSERT OR IGNORE INTO publicacoes "
+                            + "(msg_id, canal, usuario, mensagem, ts_cliente_ms, ts_publicacao_ms, servidor) "
+                            + "VALUES (?, ?, ?, ?, ?, ?, ?)")) {
+                ps.setString(1, msgId);
+                ps.setString(2, canal);
+                ps.setString(3, usuario);
+                ps.setString(4, mensagem);
+                ps.setLong(5, tsCliente);
+                ps.setLong(6, tsPublicacao);
+                ps.setString(7, servidor);
+                return ps.executeUpdate() == 1;
+            }
+        }
+
+        public void removerPublicacao(String msgId) throws SQLException {
+            try (PreparedStatement ps = con.prepareStatement("DELETE FROM publicacoes WHERE msg_id = ?")) {
+                ps.setString(1, msgId);
+                ps.executeUpdate();
+            }
+        }
+
         @Override
         public void close() throws SQLException {
             con.close();
         }
     }
 
-    static Map.Entry<String, Map<String, Object>> tratar(Protocolo.Mensagem msg, Banco banco) throws Exception {
+    static Map.Entry<String, Map<String, Object>> tratar(Protocolo.Mensagem msg, Banco banco,
+                                                           ZMQ.Socket pub, String nome) throws Exception {
         String tipo = msg.type();
         Map<String, Object> dados = msg.data();
         long agora = Protocolo.agoraMs();
@@ -119,12 +154,55 @@ public final class Servidor {
             case Protocolo.LIST_CHANNELS:
                 return new SimpleEntry<>(
                         Protocolo.LIST_CHANNELS_REPLY, Protocolo.dadosOk("channels", banco.listarCanais()));
+            case Protocolo.PUBLISH:
+                return new SimpleEntry<>(Protocolo.PUBLISH_REPLY, publicar(msg, banco, pub, nome));
             default:
                 return new SimpleEntry<>(
                         Protocolo.ERROR_REPLY,
                         Protocolo.dadosErro(
                                 Protocolo.ERR_INVALID_REQUEST, "tipo de mensagem desconhecido: " + tipo));
         }
+    }
+
+    private static Map<String, Object> publicar(Protocolo.Mensagem pedido, Banco banco,
+                                                  ZMQ.Socket pub, String nome) throws Exception {
+        Map<String, Object> dados = pedido.data();
+        Object canalObj = dados.get("channel");
+        Object textoObj = dados.get("message");
+        Object idObj = dados.get("msg_id");
+
+        if (!(canalObj instanceof String canal) || !Protocolo.CHANNEL_RE.matcher(canal).matches()) {
+            return Protocolo.dadosErro(Protocolo.ERR_INVALID_NAME,
+                    "canal deve ter 3 a 30 caracteres: letras minúsculas, números, '_' ou '-'");
+        }
+        if (!(textoObj instanceof String texto) || texto.isBlank() || texto.length() > Protocolo.MAX_MENSAGEM) {
+            return Protocolo.dadosErro(Protocolo.ERR_INVALID_REQUEST,
+                    "mensagem deve ter de 1 a " + Protocolo.MAX_MENSAGEM + " caracteres");
+        }
+        if (!(idObj instanceof String msgId) || msgId.isBlank() || msgId.length() > Protocolo.MAX_MSG_ID) {
+            return Protocolo.dadosErro(Protocolo.ERR_INVALID_REQUEST,
+                    "msg_id deve ter de 1 a " + Protocolo.MAX_MSG_ID + " caracteres");
+        }
+
+        Protocolo.Mensagem publicacao = Protocolo.criarMensagem(Protocolo.PUBLICATION, nome,
+                Map.of("channel", canal, "message", texto, "user", pedido.sender(), "msg_id", msgId));
+        boolean nova = banco.registrarPublicacao(msgId, canal, pedido.sender(), texto,
+                pedido.timestamp(), publicacao.timestamp(), nome);
+        if (!nova) {
+            Protocolo.Log.log("[servidor " + nome + "] msg_id " + msgId + " já registrado, não será publicado de novo");
+            return Protocolo.dadosOk("msg_id", msgId);
+        }
+
+        try {
+            if (!pub.sendMore(canal) || !pub.send(Protocolo.serializar(publicacao), 0)) {
+                throw new IllegalStateException("não foi possível enviar a publicação ao proxy");
+            }
+        } catch (Exception e) {
+            banco.removerPublicacao(msgId);
+            throw e;
+        }
+        Protocolo.Log.log(Protocolo.formatarLog("servidor " + nome, "PUBLICADO >> [" + canal + "]", publicacao));
+        return Protocolo.dadosOk("msg_id", msgId);
     }
 
     public static void executar() throws Exception {
@@ -134,6 +212,8 @@ public final class Servidor {
         }
         String host = System.getenv().getOrDefault("BROKER_HOST", "broker");
         String porta = System.getenv().getOrDefault("BROKER_BACKEND_PORT", "5556");
+        String proxyHost = System.getenv().getOrDefault("PROXY_HOST", "proxy");
+        String portaXsub = System.getenv().getOrDefault("PROXY_XSUB_PORT", "5557");
         String caminhoDb = System.getenv().getOrDefault("DB_PATH", "/data/" + nome + ".db");
         String quem = "servidor " + nome;
 
@@ -141,7 +221,10 @@ public final class Servidor {
                 ZContext ctx = new ZContext()) {
             ZMQ.Socket sock = ctx.createSocket(SocketType.REP);
             sock.connect("tcp://" + host + ":" + porta);
-            Protocolo.Log.log("[" + quem + "] conectado ao broker em " + host + ":" + porta + " | banco: " + caminhoDb);
+            ZMQ.Socket pub = ctx.createSocket(SocketType.PUB);
+            pub.connect("tcp://" + proxyHost + ":" + portaXsub);
+            Protocolo.Log.log("[" + quem + "] conectado ao broker em " + host + ":" + porta
+                    + " e ao proxy em " + proxyHost + ":" + portaXsub + " | banco: " + caminhoDb);
 
             while (!Thread.currentThread().isInterrupted()) {
                 byte[] raw = sock.recv(0);
@@ -154,7 +237,7 @@ public final class Servidor {
                 try {
                     Protocolo.Mensagem msg = Protocolo.desserializar(raw);
                     Protocolo.Log.log(Protocolo.formatarLog(quem, "RECEBIDO <<", msg));
-                    Map.Entry<String, Map<String, Object>> resultado = tratar(msg, banco);
+                    Map.Entry<String, Map<String, Object>> resultado = tratar(msg, banco, pub, nome);
                     tipoResp = resultado.getKey();
                     dados = resultado.getValue();
                 } catch (Protocolo.ProtocoloException e) {
@@ -169,6 +252,8 @@ public final class Servidor {
                 sock.send(Protocolo.serializar(resposta), 0);
                 Protocolo.Log.log(Protocolo.formatarLog(quem, "ENVIADO  >>", resposta));
             }
+            ctx.destroySocket(pub);
+            ctx.destroySocket(sock);
         }
     }
 }

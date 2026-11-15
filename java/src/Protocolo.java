@@ -17,7 +17,10 @@ import org.msgpack.value.Value;
 public final class Protocolo {
     private Protocolo() {}
 
-    public record Mensagem(String type, String sender, long timestamp, Map<String, Object> data) {}
+    public record Mensagem(String type, String sender, long timestamp, long logicalClock, Map<String, Object> data) {}
+
+    private static long relogioLogico = 0;
+    private static long desvioRelogioMs = 0;
 
     public static class ProtocoloException extends Exception {
         private static final long serialVersionUID = 1L;
@@ -69,11 +72,21 @@ public final class Protocolo {
     private static final DateTimeFormatter HORA = DateTimeFormatter.ofPattern("HH:mm:ss.SSS");
 
     public static long agoraMs() {
-        return System.currentTimeMillis();
+        return System.currentTimeMillis() + desvioRelogioMs;
     }
 
-    public static Mensagem criarMensagem(String tipo, String remetente, Map<String, Object> dados) {
-        return new Mensagem(tipo, remetente, agoraMs(), dados == null ? new LinkedHashMap<>() : dados);
+    public static synchronized void receberRelogioLogico(long recebido) {
+        relogioLogico = Math.max(relogioLogico, recebido);
+    }
+
+    public static synchronized void ajustarRelogioFisico(long horaReferenciaMs) {
+        desvioRelogioMs = horaReferenciaMs - System.currentTimeMillis();
+    }
+
+    public static synchronized Mensagem criarMensagem(String tipo, String remetente, Map<String, Object> dados) {
+        relogioLogico++;
+        return new Mensagem(tipo, remetente, agoraMs(), relogioLogico,
+                dados == null ? new LinkedHashMap<>() : dados);
     }
 
     public static Map<String, Object> dadosOk(Object... paresChaveValor) {
@@ -95,13 +108,15 @@ public final class Protocolo {
 
     public static byte[] serializar(Mensagem msg) {
         try (MessageBufferPacker packer = MessagePack.newDefaultBufferPacker()) {
-            packer.packMapHeader(4);
+            packer.packMapHeader(5);
             packer.packString("type");
             packer.packString(msg.type());
             packer.packString("sender");
             packer.packString(msg.sender());
             packer.packString("timestamp");
             packer.packLong(msg.timestamp());
+            packer.packString("logical_clock");
+            packer.packLong(msg.logicalClock());
             packer.packString("data");
             empacotar(packer, msg.data());
             return packer.toByteArray();
@@ -154,7 +169,7 @@ public final class Protocolo {
         if (!(obj instanceof Map<?, ?> mapa)) {
             throw new ProtocoloException("a mensagem deve ser um mapa");
         }
-        for (String campo : new String[] {"type", "sender", "timestamp", "data"}) {
+        for (String campo : new String[] {"type", "sender", "timestamp", "logical_clock", "data"}) {
             if (!mapa.containsKey(campo)) {
                 throw new ProtocoloException("campo obrigatório ausente: " + campo);
             }
@@ -165,6 +180,9 @@ public final class Protocolo {
         if (!(mapa.get("timestamp") instanceof Long timestamp)) {
             throw new ProtocoloException("'timestamp' deve ser inteiro (ms)");
         }
+        if (!(mapa.get("logical_clock") instanceof Long logicalClock)) {
+            throw new ProtocoloException("'logical_clock' deve ser inteiro");
+        }
         if (!(mapa.get("data") instanceof Map<?, ?> dadosBrutos)) {
             throw new ProtocoloException("'data' deve ser um mapa");
         }
@@ -172,7 +190,7 @@ public final class Protocolo {
         for (Map.Entry<?, ?> e : dadosBrutos.entrySet()) {
             dados.put((String) e.getKey(), e.getValue());
         }
-        return new Mensagem(tipo, remetente, timestamp, dados);
+        return new Mensagem(tipo, remetente, timestamp, logicalClock, dados);
     }
 
     private static Object converter(Value v) throws ProtocoloException {
@@ -213,14 +231,14 @@ public final class Protocolo {
 
     public static String formatarLog(String quem, String direcao, Mensagem msg) {
         return "[" + LocalTime.now().format(HORA) + "] [" + quem + "] " + direcao + " " + msg.type()
-                + " | de=" + msg.sender() + " | ts=" + msg.timestamp() + " | dados=" + repr(msg.data());
+                + " | de=" + msg.sender() + " | ts=" + msg.timestamp() + " | logical_clock=" + msg.logicalClock() + " | dados=" + repr(msg.data());
     }
 
     public static String formatarPublicacaoRecebida(String quem, String topico, Mensagem msg, long recebidoMs) {
         Map<String, Object> dados = msg.data();
         return "[" + LocalTime.now().format(HORA) + "] [" + quem + "] RECEBIDO << PUBLICAÇÃO canal=" + topico
                 + " | mensagem=" + repr(dados.get("message")) + " | autor=" + dados.get("user")
-                + " | servidor=" + msg.sender() + " | enviado_ts=" + msg.timestamp()
+                + " | servidor=" + msg.sender() + " | enviado_ts=" + msg.timestamp() + " | logical_clock=" + msg.logicalClock()
                 + " | recebido_ts=" + recebidoMs + " | atraso=" + (recebidoMs - msg.timestamp())
                 + " ms | msg_id=" + dados.get("msg_id");
     }

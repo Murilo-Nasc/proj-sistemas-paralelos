@@ -3,6 +3,7 @@ import signal
 import socket as pysocket
 import sqlite3
 import sys
+from time import sleep
 
 import zmq
 
@@ -86,6 +87,41 @@ class Banco:
     def remover_publicacao(self, msg_id: str) -> None:
         self.con.execute("DELETE FROM publicacoes WHERE msg_id = ?", (msg_id,))
         self.con.commit()
+
+
+
+class Referencia:
+    """Cliente REQ do serviço de referência, independente do broker."""
+    def __init__(self, ctx: zmq.Context, endpoint: str, nome: str) -> None:
+        self.ctx = ctx
+        self.endpoint = endpoint
+        self.nome = nome
+        self.sock = self._abrir()
+
+    def _abrir(self):
+        sock = self.ctx.socket(zmq.REQ)
+        sock.setsockopt(zmq.LINGER, 0)
+        sock.setsockopt(zmq.RCVTIMEO, 3000)
+        sock.connect(self.endpoint)
+        return sock
+
+    def requisitar(self, tipo: str, dados: dict) -> dict:
+        while True:
+            msg = p.criar_mensagem(tipo, self.nome, dados)
+            self.sock.send(p.serializar(msg))
+            log(p.formatar_log(f"servidor {self.nome} -> referência", "ENVIADO  >>", msg))
+            try:
+                resposta = p.desserializar(self.sock.recv())
+                p.receber_relogio_logico(resposta["logical_clock"])
+                log(p.formatar_log(f"servidor {self.nome} -> referência", "RECEBIDO <<", resposta))
+                return resposta
+            except zmq.Again:
+                self.sock.close(linger=0)
+                self.sock = self._abrir()
+                sleep(1)
+
+    def fechar(self) -> None:
+        self.sock.close(linger=0)
 
 
 def publicar(msg: dict, banco: Banco, pub: zmq.Socket, nome: str) -> dict:
@@ -178,6 +214,8 @@ def main() -> None:
     proxy_host = os.getenv("PROXY_HOST", "proxy")
     porta_xsub = os.getenv("PROXY_XSUB_PORT", "5557")
     caminho_db = os.getenv("DB_PATH", f"/data/{nome}.db")
+    ref_host = os.getenv("REFERENCE_HOST", "referencia")
+    ref_porta = os.getenv("REFERENCE_PORT", "5559")
 
     banco = Banco(caminho_db)
 
@@ -185,18 +223,27 @@ def main() -> None:
     sock = ctx.socket(zmq.REP)
     sock.connect(f"tcp://{host}:{porta}")
     pub = ctx.socket(zmq.PUB)
+    referencia = Referencia(ctx, f"tcp://{ref_host}:{ref_porta}", nome)
     pub.connect(f"tcp://{proxy_host}:{porta_xsub}")
     quem = f"servidor {nome}"
     log(
         f"[{quem}] conectado ao broker em {host}:{porta} e ao proxy em "
-        f"{proxy_host}:{porta_xsub} | banco: {caminho_db}"
+        f"{proxy_host}:{porta_xsub} e à referência em {ref_host}:{ref_porta} | banco: {caminho_db}"
     )
+
+    cadastro = referencia.requisitar("rank", {"name": nome})
+    rank = cadastro.get("data", {}).get("rank")
+    log(f"[{quem}] rank atribuído pela referência: {rank}")
+    lista = referencia.requisitar("list", {})
+    log(f"[{quem}] servidores disponíveis: {lista.get('data', {}).get('servers', [])}")
+    recebidas = 0
 
     try:
         while True:
             raw = sock.recv()
             try:
                 msg = p.desserializar(raw)
+                p.receber_relogio_logico(msg["logical_clock"])
                 log(p.formatar_log(quem, "RECEBIDO <<", msg))
                 tipo_resp, dados = tratar(msg, banco, pub, nome)
             except ValueError as e:
@@ -207,11 +254,23 @@ def main() -> None:
             resposta = p.criar_mensagem(tipo_resp, nome, dados)
             sock.send(p.serializar(resposta))
             log(p.formatar_log(quem, "ENVIADO  >>", resposta))
+            recebidas += 1
+            if recebidas % 10 == 0:
+                hb = referencia.requisitar("heartbeat", {"name": nome})
+                if hb.get("data", {}).get("status") != p.OK:
+                    cadastro = referencia.requisitar("rank", {"name": nome})
+                    rank = cadastro.get("data", {}).get("rank", rank)
+                    hb = referencia.requisitar("heartbeat", {"name": nome})
+                if hb.get("data", {}).get("status") == p.OK:
+                    hora_ref = hb.get("timestamp")
+                    p.ajustar_relogio_fisico(hora_ref)
+                    log(f"[{quem}] heartbeat OK | hora sincronizada: {p.agora_ms()} | rank={rank}")
     except (KeyboardInterrupt, SystemExit):
         pass
     finally:
         sock.close(linger=0)
         pub.close(linger=0)
+        referencia.fechar()
         ctx.term()
         banco.con.close()
 

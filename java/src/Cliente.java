@@ -60,6 +60,7 @@ public final class Cliente {
                 byte[] raw = sock.recv(0); // null se estourar o timeout
                 if (raw != null) {
                     Protocolo.Mensagem resposta = Protocolo.desserializar(raw);
+                    Protocolo.receberRelogioLogico(resposta.logicalClock());
                     Protocolo.Log.log(Protocolo.formatarLog(quem, "RECEBIDO <<", resposta));
                     return resposta;
                 }
@@ -117,6 +118,7 @@ public final class Cliente {
                 long recebido = Protocolo.agoraMs();
                 try {
                     Protocolo.Mensagem msg = Protocolo.desserializar(raw);
+                    Protocolo.receberRelogioLogico(msg.logicalClock());
                     if (canais.contains(topico) && Protocolo.PUBLICATION.equals(msg.type())
                             && topico.equals(msg.data().get("channel"))) {
                         Protocolo.Log.log(Protocolo.formatarPublicacaoRecebida(

@@ -17,6 +17,48 @@ import org.zeromq.ZMQ;
 public final class Servidor {
     private Servidor() {}
 
+
+    static final class Referencia {
+        private final ZContext ctx;
+        private final String endpoint;
+        private final String nome;
+        private ZMQ.Socket sock;
+
+        Referencia(ZContext ctx, String endpoint, String nome) {
+            this.ctx = ctx;
+            this.endpoint = endpoint;
+            this.nome = nome;
+            abrir();
+        }
+
+        private void abrir() {
+            sock = ctx.createSocket(SocketType.REQ);
+            sock.setLinger(0);
+            sock.setReceiveTimeOut(3000);
+            sock.connect(endpoint);
+        }
+
+        Protocolo.Mensagem requisitar(String tipo, Map<String, Object> dados) throws Exception {
+            while (true) {
+                Protocolo.Mensagem pedido = Protocolo.criarMensagem(tipo, nome, dados);
+                sock.send(Protocolo.serializar(pedido), 0);
+                Protocolo.Log.log(Protocolo.formatarLog("servidor " + nome + " -> referência", "ENVIADO  >>", pedido));
+                byte[] raw = sock.recv(0);
+                if (raw != null) {
+                    Protocolo.Mensagem resposta = Protocolo.desserializar(raw);
+                    Protocolo.receberRelogioLogico(resposta.logicalClock());
+                    Protocolo.Log.log(Protocolo.formatarLog("servidor " + nome + " -> referência", "RECEBIDO <<", resposta));
+                    return resposta;
+                }
+                ctx.destroySocket(sock);
+                Thread.sleep(1000);
+                abrir();
+            }
+        }
+
+        void fechar() { ctx.destroySocket(sock); }
+    }
+
     static class Banco implements AutoCloseable {
         private final Connection con;
 
@@ -215,6 +257,8 @@ public final class Servidor {
         String proxyHost = System.getenv().getOrDefault("PROXY_HOST", "proxy");
         String portaXsub = System.getenv().getOrDefault("PROXY_XSUB_PORT", "5557");
         String caminhoDb = System.getenv().getOrDefault("DB_PATH", "/data/" + nome + ".db");
+        String referenciaHost = System.getenv().getOrDefault("REFERENCE_HOST", "referencia");
+        String referenciaPorta = System.getenv().getOrDefault("REFERENCE_PORT", "5559");
         String quem = "servidor " + nome;
 
         try (Banco banco = new Banco(caminhoDb);
@@ -222,9 +266,20 @@ public final class Servidor {
             ZMQ.Socket sock = ctx.createSocket(SocketType.REP);
             sock.connect("tcp://" + host + ":" + porta);
             ZMQ.Socket pub = ctx.createSocket(SocketType.PUB);
+            Referencia referencia = new Referencia(ctx, "tcp://" + referenciaHost + ":" + referenciaPorta, nome);
             pub.connect("tcp://" + proxyHost + ":" + portaXsub);
             Protocolo.Log.log("[" + quem + "] conectado ao broker em " + host + ":" + porta
-                    + " e ao proxy em " + proxyHost + ":" + portaXsub + " | banco: " + caminhoDb);
+                    + " e ao proxy em " + proxyHost + ":" + portaXsub + " e à referência em "
+                    + referenciaHost + ":" + referenciaPorta + " | banco: " + caminhoDb);
+
+            Map<String, Object> dadosRank = new java.util.LinkedHashMap<>();
+            dadosRank.put("name", nome);
+            Protocolo.Mensagem cadastro = referencia.requisitar("rank", dadosRank);
+            Object rank = cadastro.data().get("rank");
+            Protocolo.Log.log("[" + quem + "] rank atribuído pela referência: " + rank);
+            Protocolo.Mensagem lista = referencia.requisitar("list", new java.util.LinkedHashMap<>());
+            Protocolo.Log.log("[" + quem + "] servidores disponíveis: " + lista.data().get("servers"));
+            int recebidas = 0;
 
             while (!Thread.currentThread().isInterrupted()) {
                 byte[] raw = sock.recv(0);
@@ -236,6 +291,7 @@ public final class Servidor {
                 Map<String, Object> dados;
                 try {
                     Protocolo.Mensagem msg = Protocolo.desserializar(raw);
+                    Protocolo.receberRelogioLogico(msg.logicalClock());
                     Protocolo.Log.log(Protocolo.formatarLog(quem, "RECEBIDO <<", msg));
                     Map.Entry<String, Map<String, Object>> resultado = tratar(msg, banco, pub, nome);
                     tipoResp = resultado.getKey();
@@ -251,7 +307,26 @@ public final class Servidor {
                 Protocolo.Mensagem resposta = Protocolo.criarMensagem(tipoResp, nome, dados);
                 sock.send(Protocolo.serializar(resposta), 0);
                 Protocolo.Log.log(Protocolo.formatarLog(quem, "ENVIADO  >>", resposta));
+                recebidas++;
+                if (recebidas % 10 == 0) {
+                    Map<String, Object> heartbeat = new java.util.LinkedHashMap<>();
+                    heartbeat.put("name", nome);
+                    Protocolo.Mensagem hb = referencia.requisitar("heartbeat", heartbeat);
+                    if (!Protocolo.OK.equals(hb.data().get("status"))) {
+                        Map<String, Object> novoCadastro = new java.util.LinkedHashMap<>();
+                        novoCadastro.put("name", nome);
+                        Protocolo.Mensagem registro = referencia.requisitar("rank", novoCadastro);
+                        rank = registro.data().get("rank");
+                        hb = referencia.requisitar("heartbeat", heartbeat);
+                    }
+                    if (Protocolo.OK.equals(hb.data().get("status"))) {
+                        Protocolo.ajustarRelogioFisico(hb.timestamp());
+                        Protocolo.Log.log("[" + quem + "] heartbeat OK | hora sincronizada: "
+                                + Protocolo.agoraMs() + " | rank=" + rank);
+                    }
+                }
             }
+            referencia.fechar();
             ctx.destroySocket(pub);
             ctx.destroySocket(sock);
         }

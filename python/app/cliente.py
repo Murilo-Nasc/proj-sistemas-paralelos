@@ -50,6 +50,7 @@ class Conexao:
             log(p.formatar_log(f"cliente {self.nome}", "ENVIADO  >>", msg))
             if self.sock.poll(TIMEOUT_MS):
                 resposta = p.desserializar(self.sock.recv())
+                p.receber_relogio_logico(resposta["logical_clock"])
                 log(p.formatar_log(f"cliente {self.nome}", "RECEBIDO <<", resposta))
                 return resposta
             log(f"[cliente {self.nome}] sem resposta em {TIMEOUT_MS} ms, tentando de novo...")
@@ -85,6 +86,7 @@ class Assinante:
         if msg["type"] != p.PUBLICATION or msg["data"].get("channel") != topico:
             log(f"[cliente {self.nome}] publicação descartada: tipo/canal inconsistente")
             return
+        p.receber_relogio_logico(msg["logical_clock"])
         log(p.formatar_publicacao_recebida(f"cliente {self.nome}", topico, msg, recebido_ms))
 
     def esperar(self, segundos: float) -> None:

@@ -16,6 +16,13 @@ services:
     container_name: broker
     command: ["python", "broker.py"]
 
+  referencia:
+    <<: *python-base
+    container_name: referencia
+    command: ["python", "referencia.py"]
+    expose:
+      - "5559"
+
   proxy:
     <<: *python-base
     container_name: proxy
@@ -33,11 +40,14 @@ services:
       DB_PATH: /data/servidor-py-1.db
       BROKER_HOST: broker
       PROXY_HOST: proxy
+      REFERENCE_HOST: referencia
+      REFERENCE_PORT: "5559"
     volumes:
       - dados-servidor-py-1:/data
     depends_on:
       - broker
       - proxy
+      - referencia
 
   servidor-py-2:
     <<: *python-base
@@ -48,11 +58,14 @@ services:
       DB_PATH: /data/servidor-py-2.db
       BROKER_HOST: broker
       PROXY_HOST: proxy
+      REFERENCE_HOST: referencia
+      REFERENCE_PORT: "5559"
     volumes:
       - dados-servidor-py-2:/data
     depends_on:
       - broker
       - proxy
+      - referencia
 
   cliente-py-1:
     <<: *python-base
@@ -95,11 +108,14 @@ services:
       DB_PATH: /data/servidor-java-1.db
       BROKER_HOST: broker
       PROXY_HOST: proxy
+      REFERENCE_HOST: referencia
+      REFERENCE_PORT: "5559"
     volumes:
       - dados-servidor-java-1:/data
     depends_on:
       - broker
       - proxy
+      - referencia
 
   servidor-java-2:
     <<: *java-base
@@ -110,11 +126,14 @@ services:
       DB_PATH: /data/servidor-java-2.db
       BROKER_HOST: broker
       PROXY_HOST: proxy
+      REFERENCE_HOST: referencia
+      REFERENCE_PORT: "5559"
     volumes:
       - dados-servidor-java-2:/data
     depends_on:
       - broker
       - proxy
+      - referencia
 
   cliente-java-1:
     <<: *java-base

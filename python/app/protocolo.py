@@ -27,16 +27,30 @@ CHANNEL_RE = re.compile(r"^[a-z0-9_-]{3,30}$")
 MAX_MENSAGEM = 500
 MAX_MSG_ID = 64
 
+_relogio_logico = 0
+_desvio_relogio_ms = 0
+
+def receber_relogio_logico(valor: int) -> None:
+    global _relogio_logico
+    _relogio_logico = max(_relogio_logico, valor)
+
+def ajustar_relogio_fisico(hora_referencia_ms: int) -> None:
+    global _desvio_relogio_ms
+    _desvio_relogio_ms = hora_referencia_ms - (time.time_ns() // 1_000_000)
+
 
 def agora_ms() -> int:
-    return time.time_ns() // 1_000_000
+    return time.time_ns() // 1_000_000 + _desvio_relogio_ms
 
 
 def criar_mensagem(tipo: str, remetente: str, dados: dict | None = None) -> dict:
+    global _relogio_logico
+    _relogio_logico += 1
     return {
         "type": tipo,
         "sender": remetente,
         "timestamp": agora_ms(),
+        "logical_clock": _relogio_logico,
         "data": dados or {},
     }
 
@@ -60,13 +74,15 @@ def desserializar(raw: bytes) -> dict:
         raise ValueError(f"MessagePack inválido: {e}") from e
     if not isinstance(msg, dict):
         raise ValueError("a mensagem deve ser um mapa")
-    for campo in ("type", "sender", "timestamp", "data"):
+    for campo in ("type", "sender", "timestamp", "logical_clock", "data"):
         if campo not in msg:
             raise ValueError(f"campo obrigatório ausente: {campo}")
     if not isinstance(msg["type"], str) or not isinstance(msg["sender"], str):
         raise ValueError("'type' e 'sender' devem ser strings")
     if not isinstance(msg["timestamp"], int):
         raise ValueError("'timestamp' deve ser inteiro (ms)")
+    if not isinstance(msg["logical_clock"], int):
+        raise ValueError("'logical_clock' deve ser inteiro")
     if not isinstance(msg["data"], dict):
         raise ValueError("'data' deve ser um mapa")
     return msg
@@ -82,7 +98,7 @@ def _hora() -> str:
 def formatar_log(quem: str, direcao: str, msg: dict) -> str:
     return (
         f"[{_hora()}] [{quem}] {direcao} {msg['type']} | de={msg['sender']} "
-        f"| ts={msg['timestamp']} | dados={msg['data']}"
+        f"| ts={msg['timestamp']} | logical_clock={msg['logical_clock']} | dados={msg['data']}"
     )
 
 
@@ -91,7 +107,7 @@ def formatar_publicacao_recebida(quem: str, topico: str, msg: dict, recebido_ms:
     return (
         f"[{_hora()}] [{quem}] RECEBIDO << PUBLICAÇÃO canal={topico} "
         f"| mensagem={dados.get('message')!r} | autor={dados.get('user')} "
-        f"| servidor={msg['sender']} | enviado_ts={msg['timestamp']} "
+        f"| servidor={msg['sender']} | enviado_ts={msg['timestamp']} | logical_clock={msg['logical_clock']} "
         f"| recebido_ts={recebido_ms} | atraso={recebido_ms - msg['timestamp']} ms "
         f"| msg_id={dados.get('msg_id')}"
     )

@@ -35,9 +35,13 @@ services:
     <<: *python-base
     container_name: servidor-py-1
     command: ["python", "servidor.py"]
+    expose:
+      - "5560"
     environment:
       NOME_SERVIDOR: servidor-py-1
       DB_PATH: /data/servidor-py-1.db
+      SERVER_PORT: "5560"
+      CLOCK_OFFSET_MS: "0"
       BROKER_HOST: broker
       PROXY_HOST: proxy
       REFERENCE_HOST: referencia
@@ -53,9 +57,13 @@ services:
     <<: *python-base
     container_name: servidor-py-2
     command: ["python", "servidor.py"]
+    expose:
+      - "5560"
     environment:
       NOME_SERVIDOR: servidor-py-2
       DB_PATH: /data/servidor-py-2.db
+      SERVER_PORT: "5560"
+      CLOCK_OFFSET_MS: "5000"
       BROKER_HOST: broker
       PROXY_HOST: proxy
       REFERENCE_HOST: referencia
@@ -103,9 +111,13 @@ services:
     <<: *java-base
     container_name: servidor-java-1
     command: ["java", "-jar", "/app/app.jar", "servidor"]
+    expose:
+      - "5560"
     environment:
       NOME_SERVIDOR: servidor-java-1
       DB_PATH: /data/servidor-java-1.db
+      SERVER_PORT: "5560"
+      CLOCK_OFFSET_MS: "-3000"
       BROKER_HOST: broker
       PROXY_HOST: proxy
       REFERENCE_HOST: referencia
@@ -121,9 +133,13 @@ services:
     <<: *java-base
     container_name: servidor-java-2
     command: ["java", "-jar", "/app/app.jar", "servidor"]
+    expose:
+      - "5560"
     environment:
       NOME_SERVIDOR: servidor-java-2
       DB_PATH: /data/servidor-java-2.db
+      SERVER_PORT: "5560"
+      CLOCK_OFFSET_MS: "8000"
       BROKER_HOST: broker
       PROXY_HOST: proxy
       REFERENCE_HOST: referencia

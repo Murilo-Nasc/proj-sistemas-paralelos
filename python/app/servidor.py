@@ -1,4 +1,6 @@
 import os
+import random
+import secrets
 import signal
 import socket as pysocket
 import sqlite3
@@ -136,6 +138,13 @@ COORDINATOR = "coordinator"
 TOPICO_SERVERS = "servers"
 ERR_NOT_COORDINATOR = "NOT_COORDINATOR"
 INTERVALO_SYNC = 15
+REPLICATION = "replication"
+SYNC_EVENTOS = "sync_events"
+SYNC_EVENTOS_REPLY = "sync_events_reply"
+TOPICO_REPLICACAO = "replicacao:eventos"
+OPERACOES = {"login": "registrar_login", "channel": "criar_canal", "publication": "registrar_publicacao"}
+LOTE_SYNC = 200
+INTERVALO_REPLICACAO_S = 30
 ESPERA_ELEICAO_S = 5.0
 
 
@@ -184,6 +193,10 @@ class Coordenacao:
         resp = self.referencia.requisitar("list", {}, max_tentativas=2)
         if resp and resp.get("data", {}).get("status") == p.OK:
             self.lista = resp["data"].get("servers", [])
+
+    def pares(self) -> list[str]:
+        self._atualizar_lista()
+        return [s["name"] for s in self.lista if s["name"] != self.nome]
 
     def precisa_eleger(self) -> bool:
         return self.eleicao_pendente or (
@@ -264,7 +277,97 @@ class Coordenacao:
         self.coordenador = novo
 
 
-def publicar(msg: dict, banco: Banco, pub: zmq.Socket, nome: str) -> dict:
+class Replicacao:
+    def __init__(self, banco: Banco, coord: Coordenacao) -> None:
+        self.banco = banco
+        self.coord = coord
+        self.origem = f"{coord.nome}#{secrets.token_hex(4)}"
+        self.seq = 0
+        self.proxima = 0.0
+        self.quem = coord.quem
+        self.banco.con.execute(
+            "CREATE TABLE IF NOT EXISTS replicacao ("
+            "origem TEXT NOT NULL, seq INTEGER NOT NULL, dados BLOB NOT NULL, "
+            "PRIMARY KEY (origem, seq))"
+        )
+
+    def _guardar(self, evento: dict) -> None:
+        msg = p.criar_mensagem(REPLICATION, self.coord.nome, {"events": [evento]})
+        self.banco.con.execute(
+            "INSERT INTO replicacao (origem, seq, dados) VALUES (?, ?, ?)",
+            (evento["origin"], evento["seq"], p.serializar(msg)),
+        )
+        self.banco.con.commit()
+
+    def registrar(self, tipo: str, dados: dict) -> None:
+        self.seq += 1
+        evento = {"origin": self.origem, "seq": self.seq, "kind": tipo, "data": dados}
+        self._guardar(evento)
+        msg = p.criar_mensagem(REPLICATION, self.coord.nome, {"events": [evento]})
+        self.coord.pub.send_multipart([TOPICO_REPLICACAO.encode("utf-8"), p.serializar(msg)])
+        log(p.formatar_log(self.quem, f"PUBLICADO >> [{TOPICO_REPLICACAO}]", msg))
+
+    def aplicar(self, eventos: list) -> int:
+        aplicados = 0
+        for ev in eventos:
+            try:
+                ultimo = self.banco.con.execute(
+                    "SELECT COALESCE(MAX(seq), 0) FROM replicacao WHERE origem = ?", (ev["origin"],)
+                ).fetchone()[0]
+                if ev["seq"] > ultimo + 1:
+                    self.proxima = 0.0   # lacuna na sequência: sincroniza já
+                elif ev["seq"] == ultimo + 1:
+                    getattr(self.banco, OPERACOES[ev["kind"]])(**ev["data"])
+                    self._guardar(ev)
+                    aplicados += 1
+            except Exception as e:  # evento inválido: não derruba o servidor
+                log(f"[{self.quem}] evento de replicação descartado: {e}")
+        if aplicados:
+            log(f"[{self.quem}] replicação: {aplicados} evento(s) aplicado(s)")
+        return aplicados
+
+    def tratar_publicacao(self, payload: bytes) -> None:
+        try:
+            msg = p.desserializar(payload)
+            p.receber_relogio_logico(msg["logical_clock"])
+            eventos = [e for e in msg["data"]["events"] if e["origin"] != self.origem]
+            if eventos:
+                log(p.formatar_log(self.quem, f"RECEBIDO << [{TOPICO_REPLICACAO}]", msg))
+                self.aplicar(eventos)
+        except (ValueError, KeyError, TypeError) as e:
+            log(f"[{self.quem}] evento de replicação descartado: {e}")
+
+    def tratar_sync(self, msg: dict) -> tuple[str, dict]:
+        try:
+            vetor = msg["data"].get("vector", {})
+            eventos = []
+            origens = [o[0] for o in self.banco.con.execute("SELECT DISTINCT origem FROM replicacao")]
+            for origem in origens:
+                linhas = self.banco.con.execute(
+                    "SELECT dados FROM replicacao WHERE origem = ? AND seq > ? ORDER BY seq LIMIT ?",
+                    (origem, vetor.get(origem, 0), LOTE_SYNC - len(eventos)),
+                ).fetchall()
+                eventos += [p.desserializar(linha[0])["data"]["events"][0] for linha in linhas]
+            return SYNC_EVENTOS_REPLY, p.dados_ok(events=eventos)
+        except Exception as e:
+            return SYNC_EVENTOS_REPLY, p.dados_erro(p.ERR_INTERNAL, str(e))
+
+    def sincronizar(self) -> None:
+        self.proxima = time.monotonic() + INTERVALO_REPLICACAO_S * random.uniform(0.7, 1.3)
+        pares = self.coord.pares()
+        log(f"[{self.quem}] sincronização com: {pares}")
+        for par in pares:
+            while True:
+                vetor = dict(self.banco.con.execute(
+                    "SELECT origem, MAX(seq) FROM replicacao GROUP BY origem").fetchall())
+                resp = requisicao_unica(self.coord.ctx, f"tcp://{par}:{self.coord.porta}", SYNC_EVENTOS,
+                                        self.coord.nome, {"vector": vetor}, self.coord.timeout_par_ms)
+                eventos = resp["data"].get("events", []) if resp else []
+                if self.aplicar(eventos) == 0 or len(eventos) < LOTE_SYNC:
+                    break
+
+
+def publicar(msg: dict, banco: Banco, pub: zmq.Socket, nome: str, repl: Replicacao) -> dict:
     dados = msg["data"]
     canal = dados.get("channel")
     texto = dados.get("message")
@@ -303,10 +406,14 @@ def publicar(msg: dict, banco: Banco, pub: zmq.Socket, nome: str) -> dict:
         banco.remover_publicacao(msg_id)
         raise
     log(p.formatar_log(quem, f"PUBLICADO >> [{canal}]", publicacao))
+    repl.registrar("publication", {
+        "msg_id": msg_id, "canal": canal, "usuario": msg["sender"], "mensagem": texto,
+        "ts_cliente": msg["timestamp"], "ts_publicacao": publicacao["timestamp"], "servidor": nome,
+    })
     return p.dados_ok(msg_id=msg_id)
 
 
-def tratar(msg: dict, banco: Banco, pub: zmq.Socket, nome: str) -> tuple[str, dict]:
+def tratar(msg: dict, banco: Banco, pub: zmq.Socket, nome: str, repl: Replicacao) -> tuple[str, dict]:
     tipo = msg["type"]
     dados = msg["data"]
     agora = p.agora_ms()
@@ -319,6 +426,7 @@ def tratar(msg: dict, banco: Banco, pub: zmq.Socket, nome: str) -> tuple[str, di
                 "usuário deve ter 3 a 20 caracteres: letras, números, '_' ou '-'",
             )
         banco.registrar_login(usuario, agora)
+        repl.registrar("login", {"usuario": usuario, "ts": agora})
         return p.LOGIN_REPLY, p.dados_ok(user=usuario)
 
     if tipo == p.CREATE_CHANNEL:
@@ -332,13 +440,14 @@ def tratar(msg: dict, banco: Banco, pub: zmq.Socket, nome: str) -> tuple[str, di
             return p.CREATE_CHANNEL_REPLY, p.dados_erro(
                 p.ERR_ALREADY_EXISTS, f"o canal '{canal}' já existe"
             )
+        repl.registrar("channel", {"nome": canal, "criado_por": msg["sender"], "ts": agora})
         return p.CREATE_CHANNEL_REPLY, p.dados_ok(channel=canal)
 
     if tipo == p.LIST_CHANNELS:
         return p.LIST_CHANNELS_REPLY, p.dados_ok(channels=banco.listar_canais())
 
     if tipo == p.PUBLISH:
-        return p.PUBLISH_REPLY, publicar(msg, banco, pub, nome)
+        return p.PUBLISH_REPLY, publicar(msg, banco, pub, nome, repl)
 
     return p.ERROR_REPLY, p.dados_erro(
         p.ERR_INVALID_REQUEST, f"tipo de mensagem desconhecido: {tipo}"
@@ -372,6 +481,7 @@ def main() -> None:
     sub = ctx.socket(zmq.SUB)
     sub.connect(f"tcp://{proxy_host}:{porta_xpub}")
     sub.setsockopt(zmq.SUBSCRIBE, TOPICO_SERVERS.encode("utf-8"))
+    sub.setsockopt(zmq.SUBSCRIBE, TOPICO_REPLICACAO.encode("utf-8"))
     par = ctx.socket(zmq.REP)               # comunicação servidor <-> servidor
     par.setsockopt(zmq.LINGER, 0)
     par.bind(f"tcp://{bind_servidores}:{porta_servidores}")
@@ -391,6 +501,7 @@ def main() -> None:
     rank = cadastro.get("data", {}).get("rank")
     log(f"[{quem}] rank atribuído pela referência: {rank}")
     coord = Coordenacao(ctx, nome, rank, referencia, pub, porta_servidores, timeout_par_ms)
+    repl = Replicacao(banco, coord)
     recebidas = 0
 
     poller = zmq.Poller()
@@ -407,7 +518,10 @@ def main() -> None:
                     msg = p.desserializar(par.recv())
                     p.receber_relogio_logico(msg["logical_clock"])
                     log(p.formatar_log(quem, "RECEBIDO << (servidor)", msg))
-                    tipo_resp, dados = coord.tratar_par(msg)
+                    if msg["type"] == SYNC_EVENTOS:
+                        tipo_resp, dados = repl.tratar_sync(msg)
+                    else:
+                        tipo_resp, dados = coord.tratar_par(msg)
                 except ValueError as e:
                     tipo_resp, dados = p.ERROR_REPLY, p.dados_erro(p.ERR_INVALID_REQUEST, str(e))
                 resposta = p.criar_mensagem(tipo_resp, nome, dados)
@@ -417,7 +531,10 @@ def main() -> None:
             if sub in eventos:
                 partes = sub.recv_multipart()
                 if len(partes) == 2:
-                    coord.tratar_anuncio(partes[0], partes[1])
+                    if partes[0].decode("utf-8", "replace") == TOPICO_REPLICACAO:
+                        repl.tratar_publicacao(partes[1])
+                    else:
+                        coord.tratar_anuncio(partes[0], partes[1])
 
             if sock in eventos:
                 raw = sock.recv()
@@ -425,7 +542,7 @@ def main() -> None:
                     msg = p.desserializar(raw)
                     p.receber_relogio_logico(msg["logical_clock"])
                     log(p.formatar_log(quem, "RECEBIDO <<", msg))
-                    tipo_resp, dados = tratar(msg, banco, pub, nome)
+                    tipo_resp, dados = tratar(msg, banco, pub, nome, repl)
                 except ValueError as e:
                     tipo_resp, dados = p.ERROR_REPLY, p.dados_erro(p.ERR_INVALID_REQUEST, str(e))
                 except Exception as e:  # erro inesperado: não derruba o servidor
@@ -452,6 +569,9 @@ def main() -> None:
 
             if coord.precisa_eleger():
                 coord.eleicao()
+
+            if time.monotonic() >= repl.proxima:
+                repl.sincronizar()
     except (KeyboardInterrupt, SystemExit):
         pass
     finally:
@@ -466,3 +586,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+    

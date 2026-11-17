@@ -10,6 +10,7 @@ import java.util.AbstractMap.SimpleEntry;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ThreadLocalRandom;
 import org.zeromq.SocketType;
 import org.zeromq.ZContext;
 import org.zeromq.ZMQ;
@@ -79,6 +80,12 @@ public final class Servidor {
     static final String ERR_NOT_COORDINATOR = "NOT_COORDINATOR";
     static final int INTERVALO_SYNC = 15;
     static final long ESPERA_ELEICAO_MS = 5000;
+    static final String REPLICATION = "replication";
+    static final String SYNC_EVENTOS = "sync_events";
+    static final String SYNC_EVENTOS_REPLY = "sync_events_reply";
+    static final String TOPICO_REPLICACAO = "replicacao:eventos";
+    static final int LOTE_SYNC = 200;
+    static final long INTERVALO_REPLICACAO_MS = 30_000;
 
     static long monotonicoMs() {
         return System.nanoTime() / 1_000_000L;
@@ -155,6 +162,17 @@ public final class Servidor {
                     && resp.data().get("servers") instanceof List<?> servidores) {
                 lista = new ArrayList<>(servidores);
             }
+        }
+
+        List<String> pares() throws Exception {
+            atualizarLista();
+            List<String> nomes = new ArrayList<>();
+            for (Object item : lista) {
+                if (item instanceof Map<?, ?> m && m.get("name") instanceof String n && !n.equals(nome)) {
+                    nomes.add(n);
+                }
+            }
+            return nomes;
         }
 
         boolean precisaEleger() {
@@ -266,8 +284,185 @@ public final class Servidor {
         }
     }
 
+    static final class Replicacao {
+        private final Banco banco;
+        private final Coordenacao coord;
+        private final String origem;
+        private long seq = 0;
+        long proximaMs = Long.MIN_VALUE;
+
+        Replicacao(Banco banco, Coordenacao coord) throws SQLException {
+            this.banco = banco;
+            this.coord = coord;
+            this.origem = coord.nome + "#" + String.format("%08x", ThreadLocalRandom.current().nextInt());
+            try (Statement st = banco.con.createStatement()) {
+                st.executeUpdate(
+                        "CREATE TABLE IF NOT EXISTS replicacao ("
+                                + "origem TEXT NOT NULL, seq INTEGER NOT NULL, dados BLOB NOT NULL, "
+                                + "PRIMARY KEY (origem, seq))");
+            }
+        }
+
+        private Protocolo.Mensagem embrulhar(Map<?, ?> evento) {
+            Map<String, Object> corpo = new java.util.LinkedHashMap<>();
+            corpo.put("events", List.of(evento));
+            return Protocolo.criarMensagem(REPLICATION, coord.nome, corpo);
+        }
+
+        private void guardar(Map<?, ?> evento) throws SQLException {
+            try (PreparedStatement ps = banco.con.prepareStatement(
+                    "INSERT INTO replicacao (origem, seq, dados) VALUES (?, ?, ?)")) {
+                ps.setString(1, (String) evento.get("origin"));
+                ps.setLong(2, (Long) evento.get("seq"));
+                ps.setBytes(3, Protocolo.serializar(embrulhar(evento)));
+                ps.executeUpdate();
+            }
+        }
+
+        void registrar(String tipo, Map<String, Object> dados) throws SQLException {
+            Map<String, Object> evento = new java.util.LinkedHashMap<>();
+            evento.put("origin", origem);
+            evento.put("seq", ++seq);
+            evento.put("kind", tipo);
+            evento.put("data", dados);
+            guardar(evento);
+            Protocolo.Mensagem msg = embrulhar(evento);
+            coord.pub.sendMore(TOPICO_REPLICACAO);
+            coord.pub.send(Protocolo.serializar(msg), 0);
+            Protocolo.Log.log(Protocolo.formatarLog(coord.quem, "PUBLICADO >> [" + TOPICO_REPLICACAO + "]", msg));
+        }
+
+        private long ultimoSeq(String origemEvento) throws SQLException {
+            try (PreparedStatement ps = banco.con.prepareStatement(
+                    "SELECT COALESCE(MAX(seq), 0) FROM replicacao WHERE origem = ?")) {
+                ps.setString(1, origemEvento);
+                try (ResultSet rs = ps.executeQuery()) {
+                    rs.next();
+                    return rs.getLong(1);
+                }
+            }
+        }
+
+        private void executar(String tipo, Map<?, ?> d) throws SQLException {
+            switch (tipo) {
+                case "login":
+                    banco.registrarLogin((String) d.get("usuario"), (Long) d.get("ts"));
+                    break;
+                case "channel":
+                    banco.criarCanal((String) d.get("nome"), (String) d.get("criado_por"), (Long) d.get("ts"));
+                    break;
+                case "publication":
+                    banco.registrarPublicacao((String) d.get("msg_id"), (String) d.get("canal"),
+                            (String) d.get("usuario"), (String) d.get("mensagem"), (Long) d.get("ts_cliente"),
+                            (Long) d.get("ts_publicacao"), (String) d.get("servidor"));
+                    break;
+                default:
+                    throw new IllegalArgumentException("tipo de evento desconhecido: " + tipo);
+            }
+        }
+
+        int aplicar(List<?> eventos) {
+            int aplicados = 0;
+            for (Object item : eventos) {
+                try {
+                    Map<?, ?> ev = (Map<?, ?>) item;
+                    long ultimo = ultimoSeq((String) ev.get("origin"));
+                    long numero = (Long) ev.get("seq");
+                    if (numero > ultimo + 1) {
+                        proximaMs = Long.MIN_VALUE; // lacuna na sequência: sincroniza já
+                    } else if (numero == ultimo + 1) {
+                        executar((String) ev.get("kind"), (Map<?, ?>) ev.get("data"));
+                        guardar(ev);
+                        aplicados++;
+                    }
+                } catch (Exception e) { // evento inválido: não derruba o servidor
+                    Protocolo.Log.log("[" + coord.quem + "] evento de replicação descartado: " + e);
+                }
+            }
+            if (aplicados > 0) {
+                Protocolo.Log.log("[" + coord.quem + "] replicação: " + aplicados + " evento(s) aplicado(s)");
+            }
+            return aplicados;
+        }
+
+        void tratarPublicacao(byte[] payload) {
+            try {
+                Protocolo.Mensagem msg = Protocolo.desserializar(payload);
+                Protocolo.receberRelogioLogico(msg.logicalClock());
+                List<Object> eventos = new ArrayList<>();
+                for (Object ev : (List<?>) msg.data().get("events")) {
+                    if (!origem.equals(((Map<?, ?>) ev).get("origin"))) {
+                        eventos.add(ev);
+                    }
+                }
+                if (!eventos.isEmpty()) {
+                    Protocolo.Log.log(Protocolo.formatarLog(coord.quem,
+                            "RECEBIDO << [" + TOPICO_REPLICACAO + "]", msg));
+                    aplicar(eventos);
+                }
+            } catch (Exception e) {
+                Protocolo.Log.log("[" + coord.quem + "] evento de replicação descartado: " + e);
+            }
+        }
+
+        Map.Entry<String, Map<String, Object>> tratarSync(Protocolo.Mensagem msg) {
+            try {
+                Map<?, ?> vetor = (Map<?, ?>) msg.data().get("vector");
+                List<Object> eventos = new ArrayList<>();
+                for (String o : vetor().keySet()) {
+                    try (PreparedStatement ps = banco.con.prepareStatement(
+                            "SELECT dados FROM replicacao WHERE origem = ? AND seq > ? ORDER BY seq LIMIT ?")) {
+                        ps.setString(1, o);
+                        ps.setLong(2, vetor.get(o) instanceof Long n ? n : 0L);
+                        ps.setInt(3, LOTE_SYNC - eventos.size());
+                        try (ResultSet rs = ps.executeQuery()) {
+                            while (rs.next()) {
+                                Protocolo.Mensagem guardada = Protocolo.desserializar(rs.getBytes(1));
+                                eventos.add(((List<?>) guardada.data().get("events")).get(0));
+                            }
+                        }
+                    }
+                }
+                return new SimpleEntry<>(SYNC_EVENTOS_REPLY, Protocolo.dadosOk("events", eventos));
+            } catch (Exception e) {
+                return new SimpleEntry<>(SYNC_EVENTOS_REPLY,
+                        Protocolo.dadosErro(Protocolo.ERR_INTERNAL, String.valueOf(e.getMessage())));
+            }
+        }
+
+        private Map<String, Long> vetor() throws SQLException {
+            Map<String, Long> vetor = new java.util.LinkedHashMap<>();
+            try (Statement st = banco.con.createStatement();
+                    ResultSet rs = st.executeQuery("SELECT origem, MAX(seq) FROM replicacao GROUP BY origem")) {
+                while (rs.next()) {
+                    vetor.put(rs.getString(1), rs.getLong(2));
+                }
+            }
+            return vetor;
+        }
+
+        void sincronizar() throws Exception {
+            proximaMs = monotonicoMs()
+                    + (long) (INTERVALO_REPLICACAO_MS * (0.7 + 0.6 * ThreadLocalRandom.current().nextDouble()));
+            List<String> pares = coord.pares();
+            Protocolo.Log.log("[" + coord.quem + "] sincronização com: " + pares);
+            for (String par : pares) {
+                while (true) {
+                    Map<String, Object> pedido = new java.util.LinkedHashMap<>();
+                    pedido.put("vector", vetor());
+                    Protocolo.Mensagem resp = requisicaoUnica(coord.ctx, "tcp://" + par + ":" + coord.porta,
+                            SYNC_EVENTOS, coord.nome, pedido, coord.timeoutParMs);
+                    List<?> eventos = resp != null && resp.data().get("events") instanceof List<?> l ? l : List.of();
+                    if (aplicar(eventos) == 0 || eventos.size() < LOTE_SYNC) {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
     static class Banco implements AutoCloseable {
-        private final Connection con;
+        final Connection con;
 
         public Banco(String caminho) throws SQLException {
             File pasta = new File(caminho).getAbsoluteFile().getParentFile();
@@ -366,7 +561,8 @@ public final class Servidor {
     }
 
     static Map.Entry<String, Map<String, Object>> tratar(Protocolo.Mensagem msg, Banco banco,
-                                                           ZMQ.Socket pub, String nome) throws Exception {
+                                                           ZMQ.Socket pub, String nome,
+                                                           Replicacao repl) throws Exception {
         String tipo = msg.type();
         Map<String, Object> dados = msg.data();
         long agora = Protocolo.agoraMs();
@@ -382,6 +578,7 @@ public final class Servidor {
                                     "usuário deve ter 3 a 20 caracteres: letras, números, '_' ou '-'"));
                 }
                 banco.registrarLogin(u, agora);
+                repl.registrar("login", Map.of("usuario", u, "ts", agora));
                 return new SimpleEntry<>(Protocolo.LOGIN_REPLY, Protocolo.dadosOk("user", u));
             }
             case Protocolo.CREATE_CHANNEL: {
@@ -398,13 +595,14 @@ public final class Servidor {
                             Protocolo.CREATE_CHANNEL_REPLY,
                             Protocolo.dadosErro(Protocolo.ERR_ALREADY_EXISTS, "o canal '" + c + "' já existe"));
                 }
+                repl.registrar("channel", Map.of("nome", c, "criado_por", msg.sender(), "ts", agora));
                 return new SimpleEntry<>(Protocolo.CREATE_CHANNEL_REPLY, Protocolo.dadosOk("channel", c));
             }
             case Protocolo.LIST_CHANNELS:
                 return new SimpleEntry<>(
                         Protocolo.LIST_CHANNELS_REPLY, Protocolo.dadosOk("channels", banco.listarCanais()));
             case Protocolo.PUBLISH:
-                return new SimpleEntry<>(Protocolo.PUBLISH_REPLY, publicar(msg, banco, pub, nome));
+                return new SimpleEntry<>(Protocolo.PUBLISH_REPLY, publicar(msg, banco, pub, nome, repl));
             default:
                 return new SimpleEntry<>(
                         Protocolo.ERROR_REPLY,
@@ -414,7 +612,8 @@ public final class Servidor {
     }
 
     private static Map<String, Object> publicar(Protocolo.Mensagem pedido, Banco banco,
-                                                  ZMQ.Socket pub, String nome) throws Exception {
+                                                  ZMQ.Socket pub, String nome,
+                                                  Replicacao repl) throws Exception {
         Map<String, Object> dados = pedido.data();
         Object canalObj = dados.get("channel");
         Object textoObj = dados.get("message");
@@ -451,6 +650,9 @@ public final class Servidor {
             throw e;
         }
         Protocolo.Log.log(Protocolo.formatarLog("servidor " + nome, "PUBLICADO >> [" + canal + "]", publicacao));
+        repl.registrar("publication", Map.of("msg_id", msgId, "canal", canal, "usuario", pedido.sender(),
+                "mensagem", texto, "ts_cliente", pedido.timestamp(), "ts_publicacao", publicacao.timestamp(),
+                "servidor", nome));
         return Protocolo.dadosOk("msg_id", msgId);
     }
 
@@ -482,6 +684,7 @@ public final class Servidor {
             ZMQ.Socket sub = ctx.createSocket(SocketType.SUB);
             sub.connect("tcp://" + proxyHost + ":" + portaXpub);
             sub.subscribe(TOPICO_SERVERS.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            sub.subscribe(TOPICO_REPLICACAO.getBytes(java.nio.charset.StandardCharsets.UTF_8));
             ZMQ.Socket par = ctx.createSocket(SocketType.REP);
             par.setLinger(0);
             par.bind("tcp://" + bindServidores + ":" + portaServidores);
@@ -503,6 +706,7 @@ public final class Servidor {
             long rank = ((Number) cadastro.data().get("rank")).longValue();
             Protocolo.Log.log("[" + quem + "] rank atribuído pela referência: " + rank);
             Coordenacao coord = new Coordenacao(ctx, nome, rank, referencia, pub, portaServidores, timeoutParMs);
+            Replicacao repl = new Replicacao(banco, coord);
             int recebidas = 0;
 
             ZMQ.Poller poller = ctx.createPoller(3);
@@ -526,7 +730,9 @@ public final class Servidor {
                         Protocolo.Mensagem msg = Protocolo.desserializar(raw);
                         Protocolo.receberRelogioLogico(msg.logicalClock());
                         Protocolo.Log.log(Protocolo.formatarLog(quem, "RECEBIDO << (servidor)", msg));
-                        Map.Entry<String, Map<String, Object>> resultado = coord.tratarPar(msg);
+                        Map.Entry<String, Map<String, Object>> resultado = SYNC_EVENTOS.equals(msg.type())
+                                ? repl.tratarSync(msg)
+                                : coord.tratarPar(msg);
                         tipoResp = resultado.getKey();
                         dados = resultado.getValue();
                     } catch (Protocolo.ProtocoloException e) {
@@ -545,7 +751,11 @@ public final class Servidor {
                         sub.recv(0);
                     }
                     if (topico != null && payload != null) {
-                        coord.tratarAnuncio(topico, payload);
+                        if (TOPICO_REPLICACAO.equals(topico)) {
+                            repl.tratarPublicacao(payload);
+                        } else {
+                            coord.tratarAnuncio(topico, payload);
+                        }
                     }
                 }
 
@@ -561,7 +771,7 @@ public final class Servidor {
                         Protocolo.Mensagem msg = Protocolo.desserializar(raw);
                         Protocolo.receberRelogioLogico(msg.logicalClock());
                         Protocolo.Log.log(Protocolo.formatarLog(quem, "RECEBIDO <<", msg));
-                        Map.Entry<String, Map<String, Object>> resultado = tratar(msg, banco, pub, nome);
+                        Map.Entry<String, Map<String, Object>> resultado = tratar(msg, banco, pub, nome, repl);
                         tipoResp = resultado.getKey();
                         dados = resultado.getValue();
                     } catch (Protocolo.ProtocoloException e) {
@@ -601,6 +811,10 @@ public final class Servidor {
 
                 if (coord.precisaEleger()) {
                     coord.eleicao();
+                }
+
+                if (monotonicoMs() >= repl.proximaMs) {
+                    repl.sincronizar();
                 }
             }
             referencia.fechar();

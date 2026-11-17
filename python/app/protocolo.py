@@ -88,6 +88,20 @@ def desserializar(raw: bytes) -> dict:
     return msg
 
 
+def serializar_dados(dados: dict) -> bytes:
+    return msgpack.packb(dados, use_bin_type=True)
+
+
+def desserializar_dados(raw: bytes) -> dict:
+    try:
+        dados = msgpack.unpackb(raw, raw=False)
+    except Exception as e:
+        raise ValueError(f"MessagePack inválido: {e}") from e
+    if not isinstance(dados, dict):
+        raise ValueError("os dados devem ser um mapa")
+    return dados
+
+
 def log(texto: str) -> None:
     print(texto, flush=True)
 

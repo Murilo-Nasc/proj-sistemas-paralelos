@@ -193,6 +193,34 @@ public final class Protocolo {
         return new Mensagem(tipo, remetente, timestamp, logicalClock, dados);
     }
 
+    public static byte[] serializarDados(Map<?, ?> dados) {
+        try (MessageBufferPacker packer = MessagePack.newDefaultBufferPacker()) {
+            empacotar(packer, dados);
+            return packer.toByteArray();
+        } catch (Exception e) {
+            throw new IllegalStateException("falha ao serializar os dados", e);
+        }
+    }
+
+    public static Map<String, Object> desserializarDados(byte[] raw) throws ProtocoloException {
+        Object obj;
+        try (MessageUnpacker unpacker = MessagePack.newDefaultUnpacker(raw)) {
+            obj = converter(unpacker.unpackValue());
+        } catch (ProtocoloException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new ProtocoloException("MessagePack inválido: " + e.getMessage(), e);
+        }
+        if (!(obj instanceof Map<?, ?> mapa)) {
+            throw new ProtocoloException("os dados devem ser um mapa");
+        }
+        Map<String, Object> dados = new LinkedHashMap<>();
+        for (Map.Entry<?, ?> e : mapa.entrySet()) {
+            dados.put((String) e.getKey(), e.getValue());
+        }
+        return dados;
+    }
+
     private static Object converter(Value v) throws ProtocoloException {
         switch (v.getValueType()) {
             case NIL:

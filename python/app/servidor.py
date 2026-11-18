@@ -200,6 +200,7 @@ class Coordenacao:
         self.porta = porta_servidores
         self.timeout_par_ms = timeout_par_ms
         self.coordenador: str | None = None
+        self.rank_coordenador = -1
         self.eleicao_pendente = False
         self.aguardando_ate = 0.0
         self.lista: list[dict] = []
@@ -241,6 +242,8 @@ class Coordenacao:
 
     def assumir(self) -> None:
         self.coordenador = self.nome
+        self.rank_coordenador = self.rank
+        self.eleicao_pendente = False
         anuncio = p.criar_mensagem(COORDINATOR, self.nome,
                                    {"coordinator": self.nome, "rank": self.rank})
         self.pub.send_multipart([TOPICO_SERVERS.encode("utf-8"), p.serializar(anuncio)])
@@ -263,6 +266,7 @@ class Coordenacao:
         else:
             log(f"[{self.quem}] coordenador '{self.coordenador}' indisponível; iniciando eleição")
             self.coordenador = None
+            self.rank_coordenador = -1
             self.eleicao()
 
     def tratar_par(self, msg: dict) -> tuple[str, dict]:
@@ -273,7 +277,8 @@ class Coordenacao:
             return CLOCK_REPLY, p.dados_erro(ERR_NOT_COORDINATOR, "este servidor não é o coordenador")
         if tipo == ELECTION:
             rank_pedido = msg["data"].get("rank")
-            if isinstance(rank_pedido, int) and rank_pedido < self.rank:
+            if (isinstance(rank_pedido, int) and rank_pedido < self.rank
+                    and self.coordenador != self.nome):
                 self.eleicao_pendente = True   # Bully: quem tem rank maior assume a eleição
             return ELECTION_REPLY, p.dados_ok()
         return p.ERROR_REPLY, p.dados_erro(p.ERR_INVALID_REQUEST, f"tipo desconhecido: {tipo}")
@@ -286,10 +291,17 @@ class Coordenacao:
             return
         p.receber_relogio_logico(msg["logical_clock"])
         novo = msg["data"].get("coordinator")
+        novo_rank = msg["data"].get("rank")
         if msg["type"] != COORDINATOR or topico.decode("utf-8", "replace") != TOPICO_SERVERS \
-                or not isinstance(novo, str):
+                or not isinstance(novo, str) or not isinstance(novo_rank, int):
+            return
+        if novo_rank < self.rank_coordenador:
+            log(f"[{self.quem}] anúncio de coordenador ignorado: rank {novo_rank} "
+                f"inferior ao atual ({self.rank_coordenador})")
             return
         self.aguardando_ate = 0.0
+        self.eleicao_pendente = False
+        self.rank_coordenador = novo_rank
         if novo != self.coordenador:
             log(f"[{self.quem}] RECEBIDO << [{TOPICO_SERVERS}] novo coordenador: {novo} "
                 f"(anterior: {self.coordenador})")

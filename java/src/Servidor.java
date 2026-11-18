@@ -136,6 +136,7 @@ public final class Servidor {
         private final int timeoutParMs;
         long rank;
         String coordenador = null;
+        long rankCoordenador = -1;
         boolean eleicaoPendente = false;
         private long aguardandoAteMs = 0;
         private List<Object> lista = new ArrayList<>();
@@ -210,6 +211,8 @@ public final class Servidor {
 
         void assumir() {
             coordenador = nome;
+            rankCoordenador = rank;
+            eleicaoPendente = false;
             Map<String, Object> dados = new java.util.LinkedHashMap<>();
             dados.put("coordinator", nome);
             dados.put("rank", rank);
@@ -240,6 +243,7 @@ public final class Servidor {
                 Protocolo.Log.log("[" + quem + "] coordenador '" + coordenador
                         + "' indisponível; iniciando eleição");
                 coordenador = null;
+                rankCoordenador = -1;
                 eleicao();
             }
         }
@@ -255,7 +259,8 @@ public final class Servidor {
                         Protocolo.dadosErro(ERR_NOT_COORDINATOR, "este servidor não é o coordenador"));
             }
             if (ELECTION.equals(tipo)) {
-                if (msg.data().get("rank") instanceof Long r && r < rank) {
+                if (msg.data().get("rank") instanceof Number r && r.longValue() < rank
+                        && !nome.equals(coordenador)) {
                     eleicaoPendente = true; // Bully: quem tem rank maior assume a eleição
                 }
                 return new SimpleEntry<>(ELECTION_REPLY, Protocolo.dadosOk());
@@ -269,10 +274,19 @@ public final class Servidor {
                 Protocolo.Mensagem msg = Protocolo.desserializar(payload);
                 Protocolo.receberRelogioLogico(msg.logicalClock());
                 if (!COORDINATOR.equals(msg.type()) || !TOPICO_SERVERS.equals(topico)
-                        || !(msg.data().get("coordinator") instanceof String novo)) {
+                        || !(msg.data().get("coordinator") instanceof String novo)
+                        || !(msg.data().get("rank") instanceof Number r)) {
+                    return;
+                }
+                long novoRank = r.longValue();
+                if (novoRank < rankCoordenador) {
+                    Protocolo.Log.log("[" + quem + "] anúncio de coordenador ignorado: rank "
+                            + novoRank + " inferior ao atual (" + rankCoordenador + ")");
                     return;
                 }
                 aguardandoAteMs = 0;
+                eleicaoPendente = false;
+                rankCoordenador = novoRank;
                 if (!novo.equals(coordenador)) {
                     Protocolo.Log.log("[" + quem + "] RECEBIDO << [" + TOPICO_SERVERS + "] novo coordenador: "
                             + novo + " (anterior: " + coordenador + ")");

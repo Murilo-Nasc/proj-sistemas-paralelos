@@ -296,6 +296,7 @@ public final class Servidor {
             this.coord = coord;
             this.origem = coord.nome + "#" + String.format("%08x", ThreadLocalRandom.current().nextInt());
             try (Statement st = banco.con.createStatement()) {
+                st.execute("PRAGMA synchronous = OFF");
                 st.executeUpdate(
                         "CREATE TABLE IF NOT EXISTS replicacao ("
                                 + "origem TEXT NOT NULL, seq INTEGER NOT NULL, dados BLOB NOT NULL, "
@@ -303,10 +304,10 @@ public final class Servidor {
             }
         }
 
-        private Protocolo.Mensagem embrulhar(Map<?, ?> evento) {
+        private Map<String, Object> corpo(Map<?, ?> evento) {
             Map<String, Object> corpo = new java.util.LinkedHashMap<>();
             corpo.put("events", List.of(evento));
-            return Protocolo.criarMensagem(REPLICATION, coord.nome, corpo);
+            return corpo;
         }
 
         private void guardar(Map<?, ?> evento) throws SQLException {
@@ -314,7 +315,8 @@ public final class Servidor {
                     "INSERT INTO replicacao (origem, seq, dados) VALUES (?, ?, ?)")) {
                 ps.setString(1, (String) evento.get("origin"));
                 ps.setLong(2, (Long) evento.get("seq"));
-                ps.setBytes(3, Protocolo.serializar(embrulhar(evento)));
+                ps.setBytes(3, Protocolo.serializar(
+                        new Protocolo.Mensagem(REPLICATION, coord.nome, Protocolo.agoraMs(), 0, corpo(evento))));
                 ps.executeUpdate();
             }
         }
@@ -326,7 +328,7 @@ public final class Servidor {
             evento.put("kind", tipo);
             evento.put("data", dados);
             guardar(evento);
-            Protocolo.Mensagem msg = embrulhar(evento);
+            Protocolo.Mensagem msg = Protocolo.criarMensagem(REPLICATION, coord.nome, corpo(evento));
             coord.pub.sendMore(TOPICO_REPLICACAO);
             coord.pub.send(Protocolo.serializar(msg), 0);
             Protocolo.Log.log(Protocolo.formatarLog(coord.quem, "PUBLICADO >> [" + TOPICO_REPLICACAO + "]", msg));
@@ -343,6 +345,15 @@ public final class Servidor {
             }
         }
 
+        private void reconciliar(String sql, Object... parametros) throws SQLException {
+            try (PreparedStatement ps = banco.con.prepareStatement(sql)) {
+                for (int i = 0; i < parametros.length; i++) {
+                    ps.setObject(i + 1, parametros[i]);
+                }
+                ps.executeUpdate();
+            }
+        }
+
         private void executar(String tipo, Map<?, ?> d) throws SQLException {
             switch (tipo) {
                 case "login":
@@ -350,11 +361,21 @@ public final class Servidor {
                     break;
                 case "channel":
                     banco.criarCanal((String) d.get("nome"), (String) d.get("criado_por"), (Long) d.get("ts"));
+                    reconciliar("UPDATE canais SET criado_por = ?, timestamp_ms = ? WHERE nome = ? "
+                            + "AND (? < timestamp_ms OR (? = timestamp_ms AND ? < criado_por))",
+                            d.get("criado_por"), d.get("ts"), d.get("nome"), d.get("ts"), d.get("ts"),
+                            d.get("criado_por"));
                     break;
                 case "publication":
                     banco.registrarPublicacao((String) d.get("msg_id"), (String) d.get("canal"),
                             (String) d.get("usuario"), (String) d.get("mensagem"), (Long) d.get("ts_cliente"),
                             (Long) d.get("ts_publicacao"), (String) d.get("servidor"));
+                    reconciliar("UPDATE publicacoes SET canal = ?, usuario = ?, mensagem = ?, ts_cliente_ms = ?, "
+                            + "ts_publicacao_ms = ?, servidor = ? WHERE msg_id = ? AND (? < ts_publicacao_ms "
+                            + "OR (? = ts_publicacao_ms AND ? < servidor))",
+                            d.get("canal"), d.get("usuario"), d.get("mensagem"), d.get("ts_cliente"),
+                            d.get("ts_publicacao"), d.get("servidor"), d.get("msg_id"), d.get("ts_publicacao"),
+                            d.get("ts_publicacao"), d.get("servidor"));
                     break;
                 default:
                     throw new IllegalArgumentException("tipo de evento desconhecido: " + tipo);
@@ -530,6 +551,28 @@ public final class Servidor {
             return canais;
         }
 
+        public List<Map<String, Object>> historico(String canal, int limite) throws SQLException {
+            List<Map<String, Object>> mensagens = new ArrayList<>();
+            try (PreparedStatement ps = con.prepareStatement(
+                    "SELECT msg_id, usuario, mensagem, ts_publicacao_ms, servidor FROM publicacoes "
+                            + "WHERE canal = ? ORDER BY ts_publicacao_ms DESC, msg_id DESC LIMIT ?")) {
+                ps.setString(1, canal);
+                ps.setInt(2, limite);
+                try (ResultSet rs = ps.executeQuery()) {
+                    while (rs.next()) {
+                        Map<String, Object> m = new java.util.LinkedHashMap<>();
+                        m.put("msg_id", rs.getString(1));
+                        m.put("user", rs.getString(2));
+                        m.put("message", rs.getString(3));
+                        m.put("timestamp", rs.getLong(4));
+                        m.put("server", rs.getString(5));
+                        mensagens.add(0, m);
+                    }
+                }
+            }
+            return mensagens;
+        }
+
         public boolean registrarPublicacao(String msgId, String canal, String usuario, String mensagem,
                                            long tsCliente, long tsPublicacao, String servidor) throws SQLException {
             try (PreparedStatement ps = con.prepareStatement(
@@ -603,6 +646,25 @@ public final class Servidor {
                         Protocolo.LIST_CHANNELS_REPLY, Protocolo.dadosOk("channels", banco.listarCanais()));
             case Protocolo.PUBLISH:
                 return new SimpleEntry<>(Protocolo.PUBLISH_REPLY, publicar(msg, banco, pub, nome, repl));
+            case Protocolo.HISTORY: {
+                Object canal = dados.get("channel");
+                Object limite = dados.getOrDefault("limit", 20L);
+                if (!(canal instanceof String c) || !Protocolo.CHANNEL_RE.matcher(c).matches()) {
+                    return new SimpleEntry<>(
+                            Protocolo.HISTORY_REPLY,
+                            Protocolo.dadosErro(
+                                    Protocolo.ERR_INVALID_NAME,
+                                    "canal deve ter 3 a 30 caracteres: letras minúsculas, números, '_' ou '-'"));
+                }
+                if (!(limite instanceof Long l) || l < 1 || l > 100) {
+                    return new SimpleEntry<>(
+                            Protocolo.HISTORY_REPLY,
+                            Protocolo.dadosErro(Protocolo.ERR_INVALID_REQUEST, "limit deve ser um inteiro de 1 a 100"));
+                }
+                return new SimpleEntry<>(
+                        Protocolo.HISTORY_REPLY,
+                        Protocolo.dadosOk("channel", c, "messages", banco.historico(c, l.intValue())));
+            }
             default:
                 return new SimpleEntry<>(
                         Protocolo.ERROR_REPLY,
@@ -678,7 +740,6 @@ public final class Servidor {
         try (Banco banco = new Banco(caminhoDb);
                 ZContext ctx = new ZContext()) {
             ZMQ.Socket sock = ctx.createSocket(SocketType.REP);
-            sock.connect("tcp://" + host + ":" + porta);
             ZMQ.Socket pub = ctx.createSocket(SocketType.PUB);
             pub.connect("tcp://" + proxyHost + ":" + portaXsub);
             ZMQ.Socket sub = ctx.createSocket(SocketType.SUB);
@@ -707,6 +768,9 @@ public final class Servidor {
             Protocolo.Log.log("[" + quem + "] rank atribuído pela referência: " + rank);
             Coordenacao coord = new Coordenacao(ctx, nome, rank, referencia, pub, portaServidores, timeoutParMs);
             Replicacao repl = new Replicacao(banco, coord);
+            repl.sincronizar();
+            sock.connect("tcp://" + host + ":" + porta);
+            Protocolo.Log.log("[" + quem + "] sincronizado; atendendo os clientes pelo broker");
             int recebidas = 0;
 
             ZMQ.Poller poller = ctx.createPoller(3);

@@ -130,6 +130,13 @@ def criar_canal(con: Conexao, nome_canal: str) -> bool:
     return False
 
 
+def historico(con: Conexao, canal: str, limite: int = 5) -> list[dict]:
+    dados = con.requisitar(p.HISTORY, {"channel": canal, "limit": limite})["data"]
+    mensagens = list(dados.get("messages", [])) if dados.get("status") == p.OK else []
+    log(f"[cliente {con.nome}] histórico do canal '{canal}': {len(mensagens)} mensagem(ns) recuperada(s)")
+    return mensagens
+
+
 def publicar(con: Conexao, canal: str, texto: str) -> bool:
     pedido = {"channel": canal, "message": texto, "msg_id": str(uuid.uuid4())}
     dados = con.requisitar(p.PUBLISH, pedido)["data"]
@@ -157,7 +164,9 @@ def rodada(con: Conexao, assinante: Assinante) -> None:
     if len(assinante.canais) < MIN_ASSINATURAS:
         candidatos = [c for c in canais if c not in assinante.canais]
         if candidatos:
-            assinante.assinar(random.choice(candidatos))
+            escolhido = random.choice(candidatos)
+            assinante.assinar(escolhido)
+            historico(con, escolhido)
 
     if not canais:
         log(f"[cliente {con.nome}] nenhum canal disponível, tentando de novo...")

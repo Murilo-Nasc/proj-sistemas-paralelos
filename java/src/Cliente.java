@@ -186,6 +186,16 @@ public final class Cliente {
         return false;
     }
 
+    static void historico(Conexao con, String canal) throws Exception {
+        Map<String, Object> pedido = new LinkedHashMap<>();
+        pedido.put("channel", canal);
+        pedido.put("limit", 5L);
+        Map<String, Object> dados = con.requisitar(Protocolo.HISTORY, pedido).data();
+        int total = Protocolo.OK.equals(dados.get("status")) && dados.get("messages") instanceof List<?> m ? m.size() : 0;
+        Protocolo.Log.log("[cliente " + con.nome + "] histórico do canal '" + canal + "': " + total
+                + " mensagem(ns) recuperada(s)");
+    }
+
     static boolean publicar(Conexao con, String canal, String texto) throws Exception {
         Map<String, Object> pedido = new LinkedHashMap<>();
         pedido.put("channel", canal);
@@ -222,7 +232,9 @@ public final class Cliente {
                 }
             }
             if (!candidatos.isEmpty()) {
-                assinante.assinar(candidatos.get(RANDOM.nextInt(candidatos.size())));
+                String escolhido = candidatos.get(RANDOM.nextInt(candidatos.size()));
+                assinante.assinar(escolhido);
+                historico(con, escolhido);
             }
         }
 

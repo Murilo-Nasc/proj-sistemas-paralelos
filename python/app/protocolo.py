@@ -13,6 +13,8 @@ LIST_CHANNELS_REPLY = "list_channels_reply"
 PUBLISH = "publish"
 PUBLISH_REPLY = "publish_reply"
 PUBLICATION = "publication"
+HISTORY = "history"
+HISTORY_REPLY = "history_reply"
 ERROR_REPLY = "error_reply"
 
 OK = "ok"
@@ -86,20 +88,6 @@ def desserializar(raw: bytes) -> dict:
     if not isinstance(msg["data"], dict):
         raise ValueError("'data' deve ser um mapa")
     return msg
-
-
-def serializar_dados(dados: dict) -> bytes:
-    return msgpack.packb(dados, use_bin_type=True)
-
-
-def desserializar_dados(raw: bytes) -> dict:
-    try:
-        dados = msgpack.unpackb(raw, raw=False)
-    except Exception as e:
-        raise ValueError(f"MessagePack inválido: {e}") from e
-    if not isinstance(dados, dict):
-        raise ValueError("os dados devem ser um mapa")
-    return dados
 
 
 def log(texto: str) -> None:

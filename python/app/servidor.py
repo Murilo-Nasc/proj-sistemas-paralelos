@@ -67,6 +67,17 @@ class Banco:
         linhas = self.con.execute("SELECT nome FROM canais ORDER BY nome").fetchall()
         return [linha[0] for linha in linhas]
 
+    def historico(self, canal: str, limite: int) -> list[dict]:
+        linhas = self.con.execute(
+            "SELECT msg_id, usuario, mensagem, ts_publicacao_ms, servidor FROM publicacoes "
+            "WHERE canal = ? ORDER BY ts_publicacao_ms DESC, msg_id DESC LIMIT ?",
+            (canal, limite),
+        ).fetchall()
+        return [
+            {"msg_id": m, "user": u, "message": t, "timestamp": ts, "server": s}
+            for m, u, t, ts, s in reversed(linhas)
+        ]
+
     def registrar_publicacao(
         self,
         msg_id: str,
@@ -144,6 +155,14 @@ SYNC_EVENTOS_REPLY = "sync_events_reply"
 TOPICO_REPLICACAO = "replicacao:eventos"
 OPERACOES = {"login": "registrar_login", "channel": "criar_canal", "publication": "registrar_publicacao"}
 LOTE_SYNC = 200
+RECONCILIAR = {
+    "channel": "UPDATE canais SET criado_por = :criado_por, timestamp_ms = :ts WHERE nome = :nome "
+               "AND (:ts < timestamp_ms OR (:ts = timestamp_ms AND :criado_por < criado_por))",
+    "publication": "UPDATE publicacoes SET canal = :canal, usuario = :usuario, mensagem = :mensagem, "
+                   "ts_cliente_ms = :ts_cliente, ts_publicacao_ms = :ts_publicacao, servidor = :servidor "
+                   "WHERE msg_id = :msg_id AND (:ts_publicacao < ts_publicacao_ms "
+                   "OR (:ts_publicacao = ts_publicacao_ms AND :servidor < servidor))",
+}
 INTERVALO_REPLICACAO_S = 30
 ESPERA_ELEICAO_S = 5.0
 
@@ -285,6 +304,7 @@ class Replicacao:
         self.seq = 0
         self.proxima = 0.0
         self.quem = coord.quem
+        self.banco.con.execute("PRAGMA synchronous = OFF")
         self.banco.con.execute(
             "CREATE TABLE IF NOT EXISTS replicacao ("
             "origem TEXT NOT NULL, seq INTEGER NOT NULL, dados BLOB NOT NULL, "
@@ -292,7 +312,8 @@ class Replicacao:
         )
 
     def _guardar(self, evento: dict) -> None:
-        msg = p.criar_mensagem(REPLICATION, self.coord.nome, {"events": [evento]})
+        msg = {"type": REPLICATION, "sender": self.coord.nome, "timestamp": p.agora_ms(),
+               "logical_clock": 0, "data": {"events": [evento]}}
         self.banco.con.execute(
             "INSERT INTO replicacao (origem, seq, dados) VALUES (?, ?, ?)",
             (evento["origin"], evento["seq"], p.serializar(msg)),
@@ -318,6 +339,9 @@ class Replicacao:
                     self.proxima = 0.0   # lacuna na sequência: sincroniza já
                 elif ev["seq"] == ultimo + 1:
                     getattr(self.banco, OPERACOES[ev["kind"]])(**ev["data"])
+                    if ev["kind"] in RECONCILIAR:
+                        self.banco.con.execute(RECONCILIAR[ev["kind"]], ev["data"])
+                        self.banco.con.commit()
                     self._guardar(ev)
                     aplicados += 1
             except Exception as e:  # evento inválido: não derruba o servidor
@@ -449,6 +473,17 @@ def tratar(msg: dict, banco: Banco, pub: zmq.Socket, nome: str, repl: Replicacao
     if tipo == p.PUBLISH:
         return p.PUBLISH_REPLY, publicar(msg, banco, pub, nome, repl)
 
+    if tipo == p.HISTORY:
+        canal, limite = dados.get("channel"), dados.get("limit", 20)
+        if not isinstance(canal, str) or not p.CHANNEL_RE.match(canal):
+            return p.HISTORY_REPLY, p.dados_erro(
+                p.ERR_INVALID_NAME,
+                "canal deve ter 3 a 30 caracteres: letras minúsculas, números, '_' ou '-'",
+            )
+        if not isinstance(limite, int) or not 1 <= limite <= 100:
+            return p.HISTORY_REPLY, p.dados_erro(p.ERR_INVALID_REQUEST, "limit deve ser um inteiro de 1 a 100")
+        return p.HISTORY_REPLY, p.dados_ok(channel=canal, messages=banco.historico(canal, limite))
+
     return p.ERROR_REPLY, p.dados_erro(
         p.ERR_INVALID_REQUEST, f"tipo de mensagem desconhecido: {tipo}"
     )
@@ -475,7 +510,6 @@ def main() -> None:
 
     ctx = zmq.Context()
     sock = ctx.socket(zmq.REP)
-    sock.connect(f"tcp://{host}:{porta}")
     pub = ctx.socket(zmq.PUB)
     pub.connect(f"tcp://{proxy_host}:{porta_xsub}")
     sub = ctx.socket(zmq.SUB)
@@ -502,6 +536,9 @@ def main() -> None:
     log(f"[{quem}] rank atribuído pela referência: {rank}")
     coord = Coordenacao(ctx, nome, rank, referencia, pub, porta_servidores, timeout_par_ms)
     repl = Replicacao(banco, coord)
+    repl.sincronizar()
+    sock.connect(f"tcp://{host}:{porta}")
+    log(f"[{quem}] sincronizado; atendendo os clientes pelo broker")
     recebidas = 0
 
     poller = zmq.Poller()
